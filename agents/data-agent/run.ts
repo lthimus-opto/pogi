@@ -31,13 +31,7 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import {
-  createAgentSession,
-  DefaultResourceLoader,
-  getAgentDir,
-  SessionManager,
-  SettingsManager,
-} from "@earendil-works/pi-coding-agent";
+import { bootstrapAgentSession, subscribeConsoleLogging } from "../../shared/lib/sdk-bootstrap.ts";
 
 // ── Args ──
 const source = process.argv[2];
@@ -93,43 +87,12 @@ const prompt = template
   .replaceAll("{{MODE}}", mode)
   .replaceAll("{{SCOPE}}", scope);
 
-// ── Resource loader: discovers .pi/skills, .pi/extensions, .pi/AGENTS.md ──
-const loader = new DefaultResourceLoader({
-  cwd,
-  agentDir: getAgentDir(),
-});
-await loader.reload();
-
-// ── Create session ──
-const { session } = await createAgentSession({
-  cwd,
-  resourceLoader: loader,
-  tools: ["read", "bash"],
-  sessionManager: SessionManager.inMemory(cwd),
-  settingsManager: SettingsManager.inMemory({
-    compaction: { enabled: true },
-    retry: { enabled: true, maxRetries: 3 },
-  }),
-});
+// ── Resource loader + session: discovers .pi/skills, .pi/extensions, .pi/AGENTS.md ──
+const { loader, session } = await bootstrapAgentSession({ cwd, tools: ["read", "bash"] });
 
 // ── Subscribe to events ──
 const runStart = Date.now();
-let toolCallCount = 0;
-let lastToolName = "";
-
-session.subscribe((event) => {
-  if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
-    process.stdout.write(event.assistantMessageEvent.delta);
-  }
-
-  // Track tool usage for the summary
-  if (event.type === "message_update" && event.assistantMessageEvent.type === "tool_use_begin") {
-    toolCallCount++;
-    lastToolName = event.assistantMessageEvent.name ?? "";
-    const elapsed = ((Date.now() - runStart) / 1000).toFixed(0);
-    console.error(`\n[${elapsed}s] Tool #${toolCallCount}: ${lastToolName}`);
-  }
-});
+const runLog = subscribeConsoleLogging(session, runStart);
 
 // ── Run ──
 console.error(`\n=== Data Agent: ${source} ===`);
@@ -229,7 +192,7 @@ try {
   await session.prompt(prompt);
 
   const elapsed = ((Date.now() - runStart) / 1000).toFixed(0);
-  console.error(`\n\n=== Run complete (${elapsed}s, ${toolCallCount} tool calls) ===`);
+  console.error(`\n\n=== Run complete (${elapsed}s, ${runLog.toolCallCount} tool calls) ===`);
   console.error(`Check: MotherDuck data_agent_local, table output.gate_verdict (filter latest + this source)`);
   console.error(`SQL:   .scratch/${source}_pipeline.sql`);
 } catch (err) {

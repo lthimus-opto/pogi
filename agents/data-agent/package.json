@@ -1,0 +1,16 @@
+{
+  "name": "data-agent",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "run": "tsx run.ts",
+    "run:sm": "tsx run.ts security_master .env.security_master.prod",
+    "incremental:sm": "MODE=incremental tsx run.ts security_master .env.security_master.prod"
+  },
+  "dependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "tsx": "^4"
+  }
+}

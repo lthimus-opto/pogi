@@ -1,16 +1,12 @@
 {
-  "name": "data-agent",
+  "name": "pogi",
   "private": true,
   "type": "module",
+  "workspaces": [
+    "agents/*"
+  ],
   "scripts": {
-    "run": "tsx run.ts",
-    "run:sm": "tsx run.ts security_master .env.security_master.prod",
-    "incremental:sm": "MODE=incremental tsx run.ts security_master .env.security_master.prod"
-  },
-  "dependencies": {
-    "@earendil-works/pi-coding-agent": "*"
-  },
-  "devDependencies": {
-    "tsx": "^4"
+    "data-agent": "npm run run --workspace=data-agent",
+    "debug-agent": "npm run run --workspace=debug-agent"
   }
 }

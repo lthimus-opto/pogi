@@ -1,5 +1,8 @@
 .scratch/
 *.duckdb
 *.duckdb.wal
-.env*
+# Real secrets live under shared/env/ -- the per-agent .env* entries are
+# symlinks into there (see agents/*/README.md) and are safe/intended to be
+# tracked, so this is scoped to the real files only, not a blanket "**/.env*".
+/shared/env/.env*
 node_modules/

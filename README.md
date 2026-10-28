@@ -1,66 +1,66 @@
-# Data Agent
+# pogi
 
-An autonomous agent that reads data from a source (Security Master
-first), maps it onto Atlas's ontology, QCs it, and proposes
-`gate_verdict` rows in MotherDuck for a downstream pipe to load into
-Atlas. It never writes to the source or to Atlas directly.
+Autonomous/interactive agents built on `@earendil-works/pi-coding-agent`'s
+SDK, each scoped to a specific operational job. npm workspaces monorepo —
+each agent is self-contained (own `.pi/AGENTS.md`, skills, knowledge base,
+queries) but shares a thin layer of real infra (`shared/`).
 
-This directory is organized into three parts:
+## Agents
 
-## 1. Operating instructions — `.pi/`
+- **[`agents/data-agent`](agents/data-agent/README.md)** — reads source
+  databases (Security Master, Atlas, Invest), maps records onto Atlas's
+  ontology, QCs them, and writes `gate_verdict`/`gate_relationship` rows
+  to MotherDuck for a downstream pipe to load. Non-interactive,
+  single-invocation-per-source.
+- **[`agents/debug-agent`](agents/debug-agent/README.md)** — diagnoses
+  infra/data issues by cross-referencing CloudWatch (logs, metrics,
+  alarms) with live DB state (connections, locks, query stats, replica
+  lag, capacity headroom) on the same Aurora cluster. Read-only,
+  primarily interactive (ask it a question).
 
-- `.pi/AGENTS.md` — standing rules that apply on every run (tool
-  restrictions, storage boundary, non-interactive behavior). Loaded
-  automatically every session.
-- `.pi/skills/` — on-demand instructions for each task, each pointing at
-  the matching file in `knowledge/` for the actual substance:
-  - `tooling-pipeline` → `knowledge/tooling_process.md`
-  - `source-mapping` → `knowledge/mapping_guide.md`
-  - `failure-modes` → `knowledge/failure_modes.md`
-  - `ingest-schemas` → `knowledge/ingest_gate_schema.md`
-  - `atlas-ontology` → `../docs/atlas_data_model.md` (+ the live Atlas
-    schema and the `opto_atlas_service` SDK — see that skill for the
-    authority order between the three)
-- `.pi/extensions/safety-guard.ts` — enforces the storage boundary
-  (read-only sources, headless runs confined to `.scratch/`).
+## Shared layer (`shared/`)
 
-## 2. Knowledge — `knowledge/`
+- `shared/connect.sh` — IAM-auth `psql` connection to the Aurora cluster,
+  symlinked into each agent as `./connect.sh` so `AGENTS.md`/skill docs
+  can reference it the same way regardless of which agent they're in.
+- `shared/env/` — the actual `.env.*` credential files (gitignored —
+  never committed), symlinked into each agent that needs them. One place
+  to update credentials instead of N copies drifting apart.
+- `shared/lib/sdk-bootstrap.ts` — the SDK session-creation boilerplate
+  every agent's `run.ts` uses (resource loading, console
+  streaming/tool-call logging). Agent-specific logic (prompt templating,
+  output schema, run tracking) stays in each agent's own `run.ts`.
 
-The living, incident-driven reference docs. Each one is discovered,
-tested against real data, and refined by a human across sessions — this
-is where confirmed facts and rules accumulate, not where they're
-invented mid-run (see `.pi/AGENTS.md`'s non-interactive rules).
+## Setup
 
-- `knowledge/mapping_guide.md` — how to map any source onto Atlas's
-  Entity/Instrument/Position ontology; the Security Master worked example.
-- `knowledge/failure_modes.md` — catalog of confirmed data-quality
-  failure modes, with trigger predicates and severities.
-- `knowledge/ingest_gate_schema.md` — the `gate_verdict`/`gate_relationship`
-  table schema and verdict logic.
-- `knowledge/tooling_process.md` — the extract/build/write pipeline,
-  and the incident history behind why it's shaped the way it is.
+```bash
+npm install   # installs + hoists all agents' dependencies via workspaces
+```
 
-## 3. Project background — `project/`
+Each agent needs its own `.env*` files under `shared/env/` (not committed —
+ask whoever set up the previous instance, or provision fresh credentials
+per `agents/data-agent/.pi/AGENTS.md`'s "Source connection" section).
 
-Narrative docs for humans; nothing here is read by the agent at runtime.
+## Running an agent
 
-- `project/vision.md` — why this exists, the confidence-bucket
-  philosophy, the use case, and where the process is headed.
-- `project/roadmap.md` — the longer-term always-on, multi-source
-  architecture (Loop A/B). Not being built yet.
+```bash
+# via root scripts
+npm run data-agent -- security_master .env.security_master.prod
+npm run debug-agent -- .env.atlas.prod "why did connections spike at 14:00 UTC?"
 
-## The task spec and the runner
+# or directly, from the agent's own directory
+cd agents/data-agent && npx tsx run.ts security_master .env.security_master.prod
+cd agents/debug-agent && npx tsx run.ts .env.atlas.prod
+```
 
-- `TASK_SPEC.md` — the actual Tasks 1-5 the agent executes end to end
-  for one source. This is what `run_prompt.md` tells the agent to run.
-- `run_prompt.md` / `run.ts` — the invocation harness (prompt template +
-  SDK entry point: `npm run run:sm`, or `npx tsx run.ts <source> <env-file>`).
-  See `run.ts` directly for how a run is actually kicked off.
+## Adding a new agent
 
-## Everything else
-
-- `connect.sh` + `.env.<database>.prod` — read-only DB access via IAM
-  auth, fresh token every call.
-- `queries/` — ad-hoc reference SQL from past investigations.
-- `.scratch/` (gitignored) — scratch SQL, reproducible pipeline scripts
-  per run, and the only place headless runs may write on disk.
+1. `agents/<name>/` with its own `package.json` (see either existing
+   agent's for the shape), `.pi/AGENTS.md`, `.pi/extensions/safety-guard.ts`,
+   `run.ts` + `run_prompt.md`.
+2. Symlink `connect.sh` and whichever `shared/env/.env*` files it needs:
+   `ln -s ../../shared/connect.sh agents/<name>/connect.sh`.
+3. Import `bootstrapAgentSession`/`subscribeConsoleLogging` from
+   `../../shared/lib/sdk-bootstrap.ts` in `run.ts` rather than
+   reimplementing session setup.
+4. Add it to this README's "Agents" list and a root `npm run <name>` script.
