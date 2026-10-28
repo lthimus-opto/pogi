@@ -1,0 +1,5 @@
+.scratch/
+*.duckdb
+*.duckdb.wal
+.env*
+node_modules/
