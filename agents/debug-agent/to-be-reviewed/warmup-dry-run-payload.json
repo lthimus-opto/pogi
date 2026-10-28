@@ -1,0 +1,207 @@
+{
+  "source_type": "arch",
+  "source_external_key": "warmup-dry-run-2026-10-28",
+  "group_key": "warmup",
+  "records": [
+    {
+      "as_of": "2026-10-28T00:00:00Z",
+      "name": "Crew Capital Fund II",
+      "name_type": "legal_name",
+      "silver_id": "0cca824b-6fab-446c-95e3-96a8e51b6732",
+      "types": [
+        {
+          "entity_type": "fund_vehicle",
+          "valid_from": "2026-10-28",
+          "valid_to": null
+        }
+      ],
+      "attributes": [
+        {
+          "attribute_name": "vintage_year",
+          "attribute_value_integer": 2025,
+          "as_of": "2026-10-28"
+        }
+      ]
+    },
+    {
+      "as_of": "2026-10-28T00:00:00Z",
+      "name": "RCF Fund I",
+      "name_type": "legal_name",
+      "silver_id": "9175ae4f-184a-4f0b-85de-7976ac732593",
+      "types": [
+        {
+          "entity_type": "fund_vehicle",
+          "valid_from": "2026-10-28",
+          "valid_to": null
+        }
+      ],
+      "attributes": [
+        {
+          "attribute_name": "vintage_year",
+          "attribute_value_integer": 1998,
+          "as_of": "2026-10-28"
+        }
+      ]
+    },
+    {
+      "as_of": "2026-10-28T00:00:00Z",
+      "name": "Cloverlay Fund II",
+      "name_type": "legal_name",
+      "silver_id": "00d07b0a-13f3-43d4-925f-679c9fbec049",
+      "types": [
+        {
+          "entity_type": "fund_vehicle",
+          "valid_from": "2026-10-28",
+          "valid_to": null
+        }
+      ],
+      "attributes": [
+        {
+          "attribute_name": "vintage_year",
+          "attribute_value_integer": 2019,
+          "as_of": "2026-10-28"
+        }
+      ]
+    },
+    {
+      "as_of": "2026-10-28T00:00:00Z",
+      "name": "Stripes Fund III",
+      "name_type": "legal_name",
+      "silver_id": "b1fabce5-d968-4beb-a550-828258dde84c",
+      "types": [
+        {
+          "entity_type": "fund_vehicle",
+          "valid_from": "2026-10-28",
+          "valid_to": null
+        }
+      ],
+      "attributes": [
+        {
+          "attribute_name": "vintage_year",
+          "attribute_value_integer": 2015,
+          "as_of": "2026-10-28"
+        }
+      ]
+    },
+    {
+      "as_of": "2026-10-28T00:00:00Z",
+      "name": "AH Fund I",
+      "name_type": "legal_name",
+      "silver_id": "4c57169d-05a3-41e8-82f9-e6fa36255d8b",
+      "types": [
+        {
+          "entity_type": "fund_vehicle",
+          "valid_from": "2026-10-28",
+          "valid_to": null
+        }
+      ],
+      "attributes": [
+        {
+          "attribute_name": "vintage_year",
+          "attribute_value_integer": 2009,
+          "as_of": "2026-10-28"
+        }
+      ]
+    },
+    {
+      "as_of": "2026-10-28T00:00:00Z",
+      "name": "Forepont Capital Partners Fund 2",
+      "name_type": "legal_name",
+      "silver_id": "a568247c-ec3d-43cd-8e97-570b468a3f58",
+      "types": [
+        {
+          "entity_type": "fund_vehicle",
+          "valid_from": "2026-10-28",
+          "valid_to": null
+        }
+      ],
+      "attributes": [
+        {
+          "attribute_name": "vintage_year",
+          "attribute_value_integer": 2020,
+          "as_of": "2026-10-28"
+        }
+      ]
+    },
+    {
+      "as_of": "2026-10-28T00:00:00Z",
+      "name": "Creation Impact Credit Fund (India), LP",
+      "name_type": "legal_name",
+      "silver_id": "4e648479-21d6-443c-ba04-9d9d9c1c78d9",
+      "types": [
+        {
+          "entity_type": "fund_vehicle",
+          "valid_from": "2026-10-28",
+          "valid_to": null
+        }
+      ],
+      "attributes": [
+        {
+          "attribute_name": "vintage_year",
+          "attribute_value_integer": 2021,
+          "as_of": "2026-10-28"
+        }
+      ]
+    },
+    {
+      "as_of": "2026-10-28T00:00:00Z",
+      "name": "Pantheon Senior Debt Secondaries II (EUR)",
+      "name_type": "legal_name",
+      "silver_id": "0f347535-73ef-417a-a16a-bc4bb1e38fca",
+      "types": [
+        {
+          "entity_type": "fund_vehicle",
+          "valid_from": "2026-10-28",
+          "valid_to": null
+        }
+      ],
+      "attributes": [
+        {
+          "attribute_name": "vintage_year",
+          "attribute_value_integer": 2022,
+          "as_of": "2026-10-28"
+        }
+      ]
+    },
+    {
+      "as_of": "2026-10-28T00:00:00Z",
+      "name": "Avante Mezzanine Partners SBIC II",
+      "name_type": "legal_name",
+      "silver_id": "ca08cd0c-d506-4f98-90cc-7f22474cf7d8",
+      "types": [
+        {
+          "entity_type": "fund_vehicle",
+          "valid_from": "2026-10-28",
+          "valid_to": null
+        }
+      ],
+      "attributes": [
+        {
+          "attribute_name": "vintage_year",
+          "attribute_value_integer": 2015,
+          "as_of": "2026-10-28"
+        }
+      ]
+    },
+    {
+      "as_of": "2026-10-28T00:00:00Z",
+      "name": "Bridge Solar Energy Development Fund",
+      "name_type": "legal_name",
+      "silver_id": "2220f736-c265-45a5-918c-19e63b81224f",
+      "types": [
+        {
+          "entity_type": "fund_vehicle",
+          "valid_from": "2026-10-28",
+          "valid_to": null
+        }
+      ],
+      "attributes": [
+        {
+          "attribute_name": "vintage_year",
+          "attribute_value_integer": 2023,
+          "as_of": "2026-10-28"
+        }
+      ]
+    }
+  ]
+}
