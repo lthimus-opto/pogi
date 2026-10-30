@@ -21,6 +21,10 @@ This directory is organized into three parts:
   - `atlas-ontology` → `../docs/atlas_data_model.md` (+ the live Atlas
     schema and the `opto_atlas_service` SDK — see that skill for the
     authority order between the three)
+  - `entity-research` → `knowledge/entity_research_guide.md` — ad-hoc,
+    read-only "what can you tell me about X" investigation of a
+    real-world firm/manager/fund family (distinct from mapping a source
+    for ingestion)
 - `.pi/extensions/safety-guard.ts` — enforces the storage boundary
   (read-only sources, headless runs confined to `.scratch/`).
 
@@ -39,6 +43,10 @@ invented mid-run (see `.pi/AGENTS.md`'s non-interactive rules).
   table schema and verdict logic.
 - `knowledge/tooling_process.md` — the extract/build/write pipeline,
   and the incident history behind why it's shaped the way it is.
+- `knowledge/entity_research_guide.md` — playbook for ad-hoc entity/
+  manager/fund-family research: finding unlinked duplicate entity
+  identities, walking `entity_relationship` in both directions, checking
+  holdings in both directions, and pivoting valuation history correctly.
 
 ## 3. Project background — `project/`
 

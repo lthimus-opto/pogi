@@ -366,6 +366,30 @@ Every entry has:
   condemn it either. 1 confirmed instance of this shape (CVC / Marathon,
   org `2346b7f2...`).
 
+  **3rd confirmed instance, found live in Atlas (not pre-load scoring) with
+  the root cause pinned exactly**: "Soundcore Capital Partners Fund II,
+  L.P." (entity `137dc6be...`) carries a `MANAGES` edge from "Two Roads
+  Partners" (`78905099...`) -- zero word overlap, and Two Roads Partners'
+  other ~9 managed funds share no naming or other connection to Soundcore.
+  Traced to the exact field: the fund's own `resolution_input_snapshot`
+  payload has `attributes: [{"attribute_name": "fund_family_label",
+  "attribute_value_text": "Two Roads Partners", ...}]` -- the *source
+  record itself* has the wrong fund_family label, which is what the
+  `manages` relationship in `relationships[]` was built from. The fund's
+  own entity resolution (matching "Soundcore Capital Partners Fund II" by
+  name) worked correctly and independently -- this is not a resolution
+  bug, it's a wrong value one level upstream, in the source row (or
+  whatever joined this fund to the wrong fund_family) that produced the
+  payload. **Diagnostic refinement**: when this fires post-load, check
+  `resolution_input_snapshot.payload -> attributes[] -> fund_family_label`
+  for the specific `input_id` behind the suspect relationship before
+  concluding anything -- it tells you definitively whether the bad value
+  came in with the source record (fix upstream, this Atlas-side edge is
+  just a symptom) or got introduced by the mapping/resolution step itself
+  (fix the agent's own build logic instead). 3 confirmed instances total
+  now, two from pre-load SM scoring and one from live-Atlas post-load
+  audit -- same predicate, different detection points in the pipeline.
+
 ---
 
 ### 6. `ai_generated_preview_not_onboarded`
@@ -683,6 +707,145 @@ until a second independent instance shows up.
   `identify_entity`-equivalent resolution needs the same never-force-create
   discipline the entity level already has.
 
+  **Update, confirmed fixed (2026-10-29)**: the entire `SYSTEM_MIGRATION`/
+  `security_master` ingestion history (the old 11-source blob, including
+  the batch that produced this incident) was deleted from Atlas prod
+  (cascaded through every dependent fact + orphaned entities/instruments)
+  and replaced with one fresh, single-run reload. In that reload, 8VC
+  Fund VI, Fund II, and Fund III **all** correctly resolved their new fee/
+  attribute data onto their pre-existing "MAIN" instruments — no new
+  disconnected third instrument was created for Fund VI this time. The
+  underlying resolution-miss this entry describes appears fixed at the
+  pipeline level, not just avoided by luck on a re-run — but this is only
+  the one manager re-tested so far. Keep the entry (don't delete it,
+  per this catalog's own discipline against losing confirmed incidents),
+  but treat it as **historical/resolved** rather than an active risk
+  until a fresh instrument-resolution miss shows up on a different
+  manager — if one does, that's a regression, worth flagging loudly as
+  such rather than re-discovering from scratch.
+
+- **`invalid_fee_attribute_name_bypasses_sdk_enum`** (new, 2026-10-29):
+  8VC Fund VII, L.P.'s `MANAGEMENT` fee has an `instrument_fee_attribute`
+  row named `stepdown_rate` (value `0.25`). Per `atlas-ontology`,
+  `ManagementFeeAttributeName` has only 4 real values
+  (`investment_rate`/`investment_basis`/`harvest_rate`/`harvest_basis`,
+  + `unknown_default_open_api`) -- no stepdown/tiered variant exists. The
+  live Postgres column (`instrument_fee_attribute.attribute_name`) is
+  plain `text`, so nothing at the DB layer blocked this -- the value
+  either went in through a write path that bypasses the SDK's typed enum
+  entirely, or the SDK has since grown a value this catalog doesn't know
+  about yet (re-verify by introspection before assuming either way).
+  Dimension: accuracy. Severity: likely `flag` (confirmed off-enum, but
+  not a value correction -- the fix is a process/pipeline question, not a
+  data edit). 1 confirmed instance. Needs a second instance, ideally from
+  a different manager/pipeline run, before promoting to a trusted rule --
+  but given how easy a direct-DB or stale-SDK write is to repeat, worth
+  checking `attribute_name` against the known enum list on every fee/
+  attribute table going forward, not just when something looks visibly
+  odd.
+
+- **`ambiguous_fund_identity_across_family_copies`** (new, 2026-10-29): a
+  single Security Master org can have **more than one `fund` row with the
+  identical name under different `fund_family` parents**, each with its
+  own, different `industry_weights`/`geography_weights` -- 8VC Angel Fund
+  I exists 3 times in `security_master.fund` (`fund_id`s
+  `7c89ce3b...`/`96240242...`/`4afaf778...`) under 3 different
+  `fund_family` rows ('8VC Angel Funds' at 0.75/0.15/0.1 IT/Industrials/
+  Health Care; a generic '8VC' family at 0.65/0.2/0.15; another generic
+  '8VC' family at 0.5/0.25/0.15/0.1 with a 4th category). Only one of the
+  three (`7c89ce3b...`) has ever been linked into Atlas
+  (`fund.atlas_entity_id` populated) -- the other two sit unresolved. This
+  is a **source-side** entity-resolution ambiguity (Security Master
+  itself doesn't have one unique 8VC Angel Fund I), not an Atlas
+  mapping bug -- but it means name-matching alone (fund name + manager)
+  is not sufficient to pick the right fund_family/weights to migrate for
+  any fund name that recurs like this. Always resolve via the fund's own
+  `id`/`atlas_entity_id` (or `silver_identifier` on the Atlas side), never
+  by name, when more than one candidate `fund_family` could own the same
+  fund name. Dimension: accuracy (source ambiguity, not Atlas's own
+  content). Severity: `flag`. 1 confirmed instance (8VC Angel Fund I,
+  org `2346b7f2...`) -- worth checking whether this recurs across other
+  multi-fund-family managers before treating it as a general pattern
+  Security Master's own data is prone to.
+
+### 9. `generic_placeholder_name_collision_across_managers`
+
+- **Dimension**: accuracy -- resolution silently merges two unrelated
+  real-world entities because they happen to share an identical,
+  non-distinguishing literal name.
+- **Severity**: `block` -- can't self-resolve; needs a human ruling plus
+  an upstream source fix, not an automated correction. A fund sitting on
+  the wrong manager is confidently wrong once discovered, not just an
+  anomaly to flag.
+- **Trigger predicate**: two or more source records with **different**
+  manager/fund_family and **different** `silver_id` share the exact same
+  literal fund name string, where that name is a generic/placeholder
+  label with no fund-specific qualifier (e.g. "Pre-Fund Investments,"
+  the kind of internal bridge/warehouse-vehicle label multiple managers
+  would independently reuse) -- and Atlas's resolution auto-attaches the
+  later record onto the earlier one via a 100%-confidence
+  `EXACT_NAME_MATCH` / `resolution_method = DEDUP_IGNORE` fast path that
+  never consults an LLM tiebreaker or checks manager-level agreement.
+- **Confirmed instance**: "Pre-Fund Investments" (entity
+  `d9c2de94-96be-400a-b239-1ffc7705aaf5`) ended up with two conflicting
+  `MANAGES` parents -- Allied Industrial Partners (`1b9c5af8...`) and
+  Diversis Capital (`705b67af...`) -- zero name overlap with either, and
+  no `resolution_correction` trail (so not a merge-leftover shell, a
+  fresh wrong-merge). `resolution_staging` for the second-landing
+  `input_id` showed `candidate_match_strategy = EXACT_NAME_MATCH`,
+  `resolution_method = DEDUP_IGNORE`, `resolution_reason = "Exact match
+  on name 'Pre-Fund Investments' (100%)"` -- confirming the merge was a
+  pure string-equality fast path, not a judgment call. Root cause is
+  **upstream, not Atlas's own resolution**: the source (fed by the IM)
+  entered the same generic, non-distinguishing name for both managers'
+  pre-formation vehicles; Atlas did exactly what a 100%-confidence exact
+  match is supposed to do with the input it was given.
+- **Population check before treating as widespread**: of 17 entities
+  found where an exact-name match had merged >1 distinct `silver_id`
+  onto one entity, only this one actually had conflicting parents. 13
+  were benign (same real fund, re-ingested under a new `silver_id` each
+  period, correctly re-attached to the same entity every time). 3
+  ("Remus Capital Fund I/II/III") turned out to be a different, milder
+  issue -- same real manager sitting under two Atlas entity records, not
+  fund conflation. So this is **not yet a widespread pattern** -- one
+  isolated confirmed instance so far -- but the underlying mechanism
+  (exact-name auto-attach with no disambiguation) is unchanged and will
+  keep being exposed to new generic names as more managers load. Re-run
+  the multi-parent check after every future load, not just once.
+- **Fix, executed**: decided to delete **both** sides of the conflated
+  entity, not just the later/"wrong-looking" one -- leaving either side
+  intact would leave the generic name alive in Atlas as a magnet for a
+  *third* manager's same-named record later. Paired with an upstream
+  name-overwrite rule (already existing capability) to disambiguate each
+  manager's record (e.g. prefixed with the manager name) before reload,
+  so the reload creates two distinct, correctly-named entities instead
+  of re-colliding.
+  **Mechanical gotcha, confirmed while scoping the fix**: the two
+  `ingestion_source_id` batches involved were *not* scoped to one fund
+  each -- each bundled the whole manager's batch (the manager entity plus
+  several other correctly-loaded funds). The source-level delete pattern
+  used elsewhere (`queries/delete_system_migration_source.sql`) assumes
+  the ingestion source *is* the right deletion granularity -- that
+  assumption doesn't hold here, and deleting the whole `ingestion_source`
+  rows would have wiped out the managers' other, correct funds as
+  collateral damage. The fix instead had to be a direct `DELETE FROM
+  entity` scoped to just the one conflated `entity_id`, verified safe via
+  `pg_constraint` first (every FK from `entity` is `ON DELETE CASCADE`
+  except `resolution_staging.input_entity_id`, which is `ON DELETE SET
+  NULL`, not `RESTRICT` -- so nothing blocks it and nothing stray gets
+  cascaded), with an explicit pre/post sibling-entity-count check proving
+  the other manager's funds were untouched. See
+  `queries/fix_pre_fund_investments_conflation.sql`.
+- **Effect on `gate_verdict`**: `REJECT`/`block` the affected
+  relationship; `DEFER` the merged entity's other facts until split --
+  not a single-field `correct`.
+- **Status**: 1 confirmed instance (Pre-Fund Investments, AIP vs
+  Diversis Capital, org `2346b7f2...`), fix executed and verified via the
+  pre/post-check script above. Needs a second instance from an unrelated
+  manager pair before the detection query (multi-parent + no name
+  overlap with either parent) is trusted as a general rule rather than a
+  one-off.
+
 ## Known non-issues (confirmed false positives — don't flag these)
 
 Not every anomaly that *looks* like a defect is one. These are confirmed
@@ -728,6 +891,97 @@ catalog entries by a future session that didn't see the reasoning.
   wrong in a real run before being corrected. See `knowledge/mapping_guide.md`'s
   "Correction: SM's own lineage fields are not Atlas's concern" for the
   full writeup.
+
+---
+
+### `dangling_parent_after_attach_correction` — a resolution-system bug, not a source failure mode, but it keeps recurring during resolving and needs to be checked for every time
+
+- **What it looks like**: a fund/entity ends up with *two* `MANAGES`/`ADVISES`
+  parent edges in `entity_relationship` — one to the correct, currently-live
+  manager, and one to an abandoned shell entity that was the *loser* side of
+  an `ATTACH` correction (`resolution_correction.correction_operation =
+  'ATTACH'`, `original_target_id` = the shell, `resolution_target_id` = the
+  surviving entity). The shell itself is otherwise empty — no name, no
+  type, no other facts — exactly what `ATTACH` is supposed to leave behind.
+  The bug is that its *own* relationship row never got cleaned up.
+- **Confirmed root cause, checked precisely (not assumed)**: in every
+  instance so far, the correct edge already existed independently on the
+  surviving entity *with the exact same `input_id`* as the stale row still
+  sitting on the shell — e.g. shell `a2cccfec...` → child `0ee2beee...` and
+  survivor `1af4bda5...` → child `0ee2beee...` both carried `input_id =
+  55c592ba-...`. This means the correct edge was independently created on
+  the surviving entity (by the same ingestion batch or a later one) — the
+  defect is purely that the superseded copy on the shell was never deleted,
+  **not** that a relationship "never got moved." Confirming this by
+  comparing `input_id` (and `parent_entity_id`/`child_entity_id`/
+  `relationship_type`) before touching anything matters: assuming the
+  relationship needed to be *moved* (insert-on-survivor, delete-on-shell)
+  instead of *removed* (delete-on-shell only) would have written an exact
+  duplicate row on the surviving entity — a real near-miss in this session,
+  caught only by checking the survivor's existing edges first.
+- **Detection query**: entities with >1 distinct parent in
+  `entity_relationship` (see `queries/review_system_migration.sql`'s
+  "entities with MULTIPLE distinct parents" check) — but note not every
+  hit is this failure mode (see entry 5's 3rd confirmed instance above —
+  `possible_misattributed_manager` — for a hit on the same multi-parent
+  query that turned out to be a completely different, upstream-source-data
+  cause: a wrong `fund_family_label` value, not a stale post-correction
+  edge).
+- **Fix pattern**: `queries/fix_wynnchurch_dangling_relationships.sql`
+  (1st instance) and `queries/fix_system_migration_dangling_relationships.sql`
+  (2nd and 3rd instances, Crestline/True Wind) — always diff the shell's
+  edge against the survivor's existing edges by `input_id` first; only
+  `INSERT`-then-`DELETE` (move) if no matching edge already exists on the
+  survivor, otherwise just `DELETE` the shell's stale copy.
+- **Status**: 3 confirmed instances across 2 sessions (Wynnchurch; then
+  Crestline and True Wind Capital together in one later batch), and it
+  recurred again within the same resolving session that produced the first
+  fix — this is a property of the `ATTACH` correction workflow itself, not
+  of data volume, and should be expected to keep recurring until the
+  correction process is changed to clean up the superseded entity's own
+  relationship rows as part of the `ATTACH` operation. Re-run the
+  multi-parent detection query after every batch of corrections, not just
+  once per source.
+
+---
+
+### `cross_source_eav_corroboration_is_not_a_duplicate` — a reviewing-methodology correction, not a source failure mode
+
+- **What it looks like**: an entity/instrument appears to have multiple
+  "duplicate" active rows in a time-series/EAV table — e.g. 513
+  `(entity_id, entity_type)` pairs with >1 row where `valid_to IS NULL`,
+  662 `(entity_id, name_type)` pairs in `entity_name`, similarly for
+  `instrument_name` and `instrument_fee`. Counted naively (just `GROUP BY
+  ... HAVING COUNT(*) > 1`), this looks like a real, large duplicate
+  problem.
+- **Confirmed false positive, checked exhaustively**: joining every one of
+  those groups back to `ingestion_source` and grouping by
+  `ingestion_source_group_key` showed **0 same-source duplicates and 100%
+  cross-source** across all five tables checked (entity_type, entity_name,
+  entity_attribute exact-value repeats, instrument_name, instrument_fee).
+  Every "duplicate" row was an independent, differently-sourced claim
+  (`security_master`, `form_adv_monthly`, `arch_soi`, `diligence_extraction`)
+  re-asserting the same fact — exactly the documented Atlas design
+  (`atlas_data_model.md`'s "Ingestion Source: The Critical Foundation":
+  "one row = one source's claim, never blended"). There was no actual
+  duplicate-row problem in this dataset once checked this way.
+- **Why this matters enough to log**: a first pass at this in a real
+  session concluded these were safe to mechanically collapse (close every
+  row but the latest by `valid_from`) — which would have been actively
+  wrong: it would have terminated one source's independent, still-valid
+  claim based on an unrelated source's later timestamp, corrupting the
+  per-source lineage the `ingestion_source_id` FK exists to preserve.
+- **The actual rule going forward**: never call a repeated-row group in
+  any `*_ingestion_source`-linked table a "duplicate" without grouping by
+  `ingestion_source_group_key` (or `ingestion_source_id`) first. Only a
+  group where every row shares the **same** source is a real duplicate
+  candidate; a group spanning multiple sources is corroboration by design,
+  full stop, regardless of how large the row count looks.
+- **Status**: checked exhaustively (not sampled) across 5 tables in one
+  session, 0/1,205 flagged groups were same-source. No counter-example yet
+  of a genuine same-source duplicate in this data — if one ever turns up,
+  it'd be the first real instance of an actual EAV duplicate rather than
+  this false-positive pattern.
 
 ---
 

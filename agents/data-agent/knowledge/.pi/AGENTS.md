@@ -114,8 +114,12 @@ mattered most across every investigation so far — treat a run that skips
 ## Skills available
 
 You have skills loaded for: `atlas-ontology`, `source-mapping`,
-`failure-modes`, `ingest-schemas`, `tooling-pipeline`. Load each one
-when you reach the task that needs it — don't read all docs upfront.
+`failure-modes`, `ingest-schemas`, `tooling-pipeline`, `entity-research`.
+Load each one when you reach the task that needs it — don't read all docs
+upfront. `entity-research` is specifically for ad-hoc "what can you tell
+me about X" investigation questions (as opposed to mapping a source for
+ingestion) — load it whenever a question asks for a research summary of
+a real-world firm/manager/fund family by name.
 
 ## When running non-interactively
 

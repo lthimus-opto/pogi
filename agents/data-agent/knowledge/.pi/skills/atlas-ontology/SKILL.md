@@ -136,11 +136,25 @@ docstrings are the reference for the SDK's payload shapes and endpoints.
      `valid_to` (**required as a key, but accepts `null`** — confirmed via live
      Swagger validation: all three of `strategy_group_id`/`valid_from`/`valid_to`
      throw "Field required" if the key is missing entirely, not just if null).
-     **There is no weight/percentage field, and this is deliberate, not a gap** —
-     a static weight baked in at ingest time is a malformed model: allocation
-     weights drift over time and must be derived/computed, not hardcoded from a
-     single marketing snapshot (worse, the old convention derived them from a
-     "best guess" off category names). Don't propose adding a weight field here.
+     **Correction (confirmed wrong — a real `weight numeric` column exists and is
+     live, as of a 2026-10-29 session reviewing a fresh Security-Master
+     migration run against the live schema)**: an earlier version of this
+     doc claimed there is no weight/percentage field, and that this was
+     deliberate. That was wrong on the live-schema side (authority #2 above) —
+     `entity_strategy.weight` is a real, populated column, not a gap. Checked
+     directly: 8VC's fund entities each carry per-tier `weight` values (e.g.
+     `industry`/`Information Technology`=0.75, `Industrials`=0.15,
+     `Health Care`=0.1 on "8VC Angel Fund I") that trace exactly, 1:1, back to
+     Security Master's own `fund_family.industry_weights`/`geography_weights`
+     JSON columns (keyed at the fund-family level, inherited by every fund
+     under it) — not derived, not a best-guess, a direct copy of a real
+     source-stated percentage. The `EntityStrategyCreate` *SDK model* may or
+     may not expose this field yet (re-verify by introspection per the "Key
+     principle" above before assuming either way) — but do not tell a future
+     session "don't propose a weight field here," the live data already has
+     one and a real pipeline is already populating it from source weights.
+     If the SDK model turns out not to expose it, that's a gap to raise, not
+     a deliberate design choice to defend.
    - Entity types: see `EntityType` enum — ~20 values including
      `management_company`, `fund_vehicle`, `spv`, `co_investment`,
      `registered_advisor`, `general_partner`, `limited_partner`, `family_office`, etc.
@@ -202,11 +216,19 @@ other source's claim), and cascade-delete ordering. **"One row = one
 source's claim, never blended"** — if two sources agree or disagree about a
 fact, that's always two independent, separately-traceable rows.
 
-- `IngestionSourceType` enum — **only 6 real values**: `arch`, `manual`,
-  `msci`, `pitch_deck`, `sec_adv`, `sec_edgar` (+ `unknown_default_open_api`).
-  No `security_master` value exists. **Decided: Security-Master-sourced
-  data uses `manual`.** Not a placeholder pending a future PR — this is
-  the settled choice; it only changes if that decision changes.
+- `IngestionSourceType` enum — **correction, confirmed via live schema on
+  2026-10-29**: the live Postgres `ingestionsourcetype` enum actually has
+  **7 values**: `arch`, `manual`, `msci`, `pitch_deck`, `sec_adv`,
+  `sec_edgar`, **`system_migration`** (+ `unknown_default_open_api` if the
+  SDK model still carries that fallback — re-verify by introspection, don't
+  assume). An earlier version of this doc said Security-Master-sourced data
+  uses `manual` as a settled decision — that's now contradicted by live
+  data: every `security_master` `group_key` row in `ingestion_source`
+  actually has `source_type = 'SYSTEM_MIGRATION'`, not `MANUAL`. Whether
+  that's the currently-intended value or a pipeline that hasn't been
+  updated to match an older decision is unconfirmed — don't silently
+  re-decide this again; confirm with whoever owns the ingest pipeline
+  before writing new Security-Master records with either value.
 - `org_id` on the request — "organization that owns or uploaded this
   source," used downstream by the (not-yet-implemented)
   `SOURCE_RECORD_OWNERSHIP`/`ORG_SOURCE_ENTITLEMENTS` tables for

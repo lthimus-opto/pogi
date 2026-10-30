@@ -261,16 +261,21 @@ the category names map to `ENTITY_STRATEGY` (`strategy_system='INTERNAL'`,
 the fund entity) -- the same table/tiers `atlas_data_model.md` documents
 for a fund's stated industry/geo focus.
 
-**On the weight/percentage**: SM now has a real numeric weight for this
-(a `strategy_weight_exposure` table, found on a later pass -- `percentage`
-DOUBLE + `strategy_id` FK, not the JSON-only `industry_weights` this guide
-originally checked). But `EntityStrategyCreate` in the real SDK has **no
-field to carry a weight at all** -- and per `atlas-ontology`, that's
-deliberate, not a gap: a static weight baked in at ingest time would drift
-out of date as the portfolio changes, and the old convention derived it
-from a category-name best-guess anyway. So don't propose adding a weight
-field here -- the category membership maps cleanly; the weight simply
-doesn't belong as a static entity-level fact.
+**On the weight/percentage -- correction, confirmed wrong on a real pull
+(2026-10-29, 8VC migration run)**: this doc previously said `EntityStrategyCreate`
+has no field to carry a weight at all, and that this was deliberate. Both
+halves of that were wrong. `entity_strategy` has a real, live `weight`
+numeric column, and it's actively populated: `fund_family.industry_weights`/
+`geography_weights` (the JSON columns, e.g. `{"Information Technology": 0.75,
+"Industrials": 0.15, "Health Care": 0.1}`) map directly, key-for-key and
+value-for-value, onto `entity_strategy.weight` for every fund entity under
+that family -- checked end to end via `silver_identifier` lineage on "8VC
+Angel Fund I": source `fund_family.industry_weights` == destination
+`entity_strategy` rows' `weight`, exactly, no transformation. Map the
+weight whenever the source has one -- don't drop it. The dangling
+`strategy_weight_exposure.strategy_id` (see below) is still a dead end and
+still not worth resolving, but that's a different, narrower finding than
+"there's nowhere for a weight to go at all."
 
 ### Red flag hit #2 — level conflation
 
@@ -425,12 +430,14 @@ this agent can resolve read-only via `connect.sh`. This doesn't actually
 cost anything, though: `fund_family.industry_weights`/`geography_weights`
 (JSON columns, e.g. `{"Industrials": 1.0}`, `{"North America": 1.0}`)
 already carry the category *names* directly and map cleanly to
-`ENTITY_STRATEGY` as this doc's worked example describes -- and
-`EntityStrategyCreate` has no weight field to carry the percentage
-anyway (deliberate, see `atlas-ontology`). So the unresolvable
-`strategy_id` was never going to be used downstream regardless -- extract
-`strategy_weight_exposure` for completeness-evidence purposes only if you
-like, but don't block mapping on resolving it.
+`ENTITY_STRATEGY` as this doc's worked example describes -- **and, corrected
+above, `entity_strategy.weight` is real and should carry exactly these JSON
+values**, not be left empty. So the unresolvable `strategy_id` was never
+going to be used downstream regardless -- extract `strategy_weight_exposure`
+for completeness-evidence purposes only if you like, but don't block
+mapping on resolving it, and don't use its dead-endedness as a reason to
+skip populating `weight` from `fund_family`'s own JSON columns, which work
+fine on their own.
 
 ### `fund.atlas_entity_id` -- the source row sometimes already caches its own resolved Atlas entity
 
