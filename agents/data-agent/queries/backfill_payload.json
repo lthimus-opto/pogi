@@ -1,0 +1,97 @@
+{
+  "query": "mutation LaunchBackfill($backfillParams: LaunchBackfillParams!) { launchPartitionBackfill(backfillParams: $backfillParams) { __typename ... on LaunchBackfillSuccess { backfillId launchedRunIds } ... on PythonError { message stack } ... on PartitionSetNotFoundError { message } ... on RunConfigValidationInvalid { errors { message } } ... on ConflictingExecutionParamsError { message } } }",
+  "variables": {
+    "backfillParams": {
+      "assetSelection": [
+        {
+          "path": [
+            "ingest",
+            "onboarding",
+            "security_master",
+            "security_master_manager_atlas_ingest"
+          ]
+        },
+        {
+          "path": [
+            "ingest",
+            "onboarding",
+            "security_master",
+            "security_master_fund_atlas_ingest"
+          ]
+        },
+        {
+          "path": [
+            "ingest",
+            "onboarding",
+            "security_master",
+            "security_master_instrument_atlas_ingest"
+          ]
+        }
+      ],
+      "partitionNames": [
+        "6f6a7d03-5020-48bb-b676-cff62fd4d96f|2346b7f2-b69f-40bb-a53c-d8447008fe42",
+        "d7a1edec-f386-4d7b-9889-c32d85c282d6|2346b7f2-b69f-40bb-a53c-d8447008fe42",
+        "b64ccc0e-1ee8-49b7-ac01-5b77ad234248|2346b7f2-b69f-40bb-a53c-d8447008fe42",
+        "5b958e1a-de8b-4445-86af-f949eb72adfc|2346b7f2-b69f-40bb-a53c-d8447008fe42",
+        "48f9c4cc-7222-4cef-bbd3-43b0a68e60da|2346b7f2-b69f-40bb-a53c-d8447008fe42",
+        "2447cde5-9671-4972-9c8a-6a9f861c4184|2346b7f2-b69f-40bb-a53c-d8447008fe42",
+        "41c5ffe2-aeb8-40fc-9025-90650cadfa15|2346b7f2-b69f-40bb-a53c-d8447008fe42",
+        "0529d493-92a0-441f-922a-ee5902ca7438|2346b7f2-b69f-40bb-a53c-d8447008fe42",
+        "b2cd86ea-5b4d-44e6-9b7c-5e349d7e003b|2346b7f2-b69f-40bb-a53c-d8447008fe42",
+        "7f4a7fcc-207a-47a7-8891-7a6d4a4d3c8e|2346b7f2-b69f-40bb-a53c-d8447008fe42",
+        "82c2afd3-73c3-4dc1-be70-89e5c2967707|2346b7f2-b69f-40bb-a53c-d8447008fe42",
+        "ebc6b7e7-e4f9-40f9-8cfa-58b3c836228e|2346b7f2-b69f-40bb-a53c-d8447008fe42",
+        "26aa7ab0-b3e5-4286-a65c-3c00fb14052e|2346b7f2-b69f-40bb-a53c-d8447008fe42",
+        "b5b8f1be-7572-4749-b859-a79e1198d7b8|2346b7f2-b69f-40bb-a53c-d8447008fe42",
+        "18bad7bc-8ff5-4e23-ae66-8fb0b6fd2136|2346b7f2-b69f-40bb-a53c-d8447008fe42",
+        "57be1beb-d291-4ded-b643-6e9965c1dfdd|2346b7f2-b69f-40bb-a53c-d8447008fe42",
+        "9ee5b19f-6b3e-4892-ac93-996297d24b15|2346b7f2-b69f-40bb-a53c-d8447008fe42",
+        "05252864-4d0e-4599-ad5e-4324669f6a15|2346b7f2-b69f-40bb-a53c-d8447008fe42",
+        "df62f520-b081-468e-8059-0a8c6e902d1d|2346b7f2-b69f-40bb-a53c-d8447008fe42",
+        "4e34769e-a4a2-448c-82b9-dcebd14dcfcf|2346b7f2-b69f-40bb-a53c-d8447008fe42",
+        "118b5969-afc3-4f18-86b6-4fc9895003b0|2346b7f2-b69f-40bb-a53c-d8447008fe42",
+        "eb213c9e-6ef5-4725-91c9-ccc0f62cc529|2346b7f2-b69f-40bb-a53c-d8447008fe42",
+        "c444b9c1-75e5-4a4f-be7e-c435b76cdee1|2346b7f2-b69f-40bb-a53c-d8447008fe42",
+        "a62d9d77-c055-4052-83d7-3d0976e9eeda|2346b7f2-b69f-40bb-a53c-d8447008fe42",
+        "005003ce-a3ee-459a-9d44-b5978e8dbdb8|2346b7f2-b69f-40bb-a53c-d8447008fe42",
+        "ba32e010-a635-4c4b-8c34-490d102936b4|2346b7f2-b69f-40bb-a53c-d8447008fe42",
+        "67cc7615-e703-4529-a53c-5975ad363f32|2346b7f2-b69f-40bb-a53c-d8447008fe42",
+        "691e7b69-25bc-4ffc-960c-8171ac576acf|2346b7f2-b69f-40bb-a53c-d8447008fe42",
+        "42d10d37-06a8-424a-a657-9a7d1dfd1614|2346b7f2-b69f-40bb-a53c-d8447008fe42",
+        "66ecf944-9936-4468-92f6-3272aef74497|2346b7f2-b69f-40bb-a53c-d8447008fe42",
+        "9ce00a19-a40d-42fa-9bad-4f82af6e04ae|2346b7f2-b69f-40bb-a53c-d8447008fe42",
+        "50e41091-7b1b-4591-83eb-bc94262ea20d|2346b7f2-b69f-40bb-a53c-d8447008fe42",
+        "805ba7f1-d945-413c-ad43-4c3a2bd4ca07|2346b7f2-b69f-40bb-a53c-d8447008fe42",
+        "eec3cbf4-7159-4075-ba8c-87657300c1a4|2346b7f2-b69f-40bb-a53c-d8447008fe42",
+        "ac783310-97af-4847-94ad-a336d656fa11|2346b7f2-b69f-40bb-a53c-d8447008fe42",
+        "0aec44b8-f035-4d13-937c-ede65a44bed8|2346b7f2-b69f-40bb-a53c-d8447008fe42",
+        "4a7fa7f1-4b70-4a7b-aa34-2cde05b58645|2346b7f2-b69f-40bb-a53c-d8447008fe42",
+        "f910f36e-d025-44f6-9334-25f11cf99fd2|2346b7f2-b69f-40bb-a53c-d8447008fe42",
+        "2c21d266-a383-463e-9df7-db8cccc61e97|2346b7f2-b69f-40bb-a53c-d8447008fe42",
+        "afd9c8ad-a5f0-45bf-9886-91c965b23e64|2346b7f2-b69f-40bb-a53c-d8447008fe42",
+        "b7af61a9-4ce7-4ad1-af0d-df4c8d0bfedb|2346b7f2-b69f-40bb-a53c-d8447008fe42",
+        "dbf886e9-f730-46d4-b332-f46fb22923a7|2346b7f2-b69f-40bb-a53c-d8447008fe42",
+        "f12eb169-8006-4a58-a802-ec7367dfd67d|2346b7f2-b69f-40bb-a53c-d8447008fe42",
+        "1b70bf5f-f5c0-48c9-b991-299cf389182b|2346b7f2-b69f-40bb-a53c-d8447008fe42",
+        "8d9bf835-aeaa-4836-9429-c6103effbb3a|2346b7f2-b69f-40bb-a53c-d8447008fe42",
+        "db682a22-f4c8-4ddf-a4b3-36eb7a5f26af|2346b7f2-b69f-40bb-a53c-d8447008fe42",
+        "ce6610ba-8630-498d-a926-1469d8409dd8|2346b7f2-b69f-40bb-a53c-d8447008fe42",
+        "f98939cd-46f3-48c4-8384-f76ae00073bd|2346b7f2-b69f-40bb-a53c-d8447008fe42",
+        "caa29ad6-1e02-4843-aa86-4122c5f9e07e|2346b7f2-b69f-40bb-a53c-d8447008fe42",
+        "ea28345c-daf7-446f-aa22-f46b86869b2a|2346b7f2-b69f-40bb-a53c-d8447008fe42",
+        "11e7ba85-6189-4f55-8a01-64b553c9a6a2|2346b7f2-b69f-40bb-a53c-d8447008fe42",
+        "e6f7fb40-31a9-41c3-bb85-0562cf7e3206|2346b7f2-b69f-40bb-a53c-d8447008fe42",
+        "1dcaa1a8-5260-4122-b070-4e20824e37c5|2346b7f2-b69f-40bb-a53c-d8447008fe42",
+        "5f4753f8-164b-46c9-9029-ad5cdcb0f93a|2346b7f2-b69f-40bb-a53c-d8447008fe42",
+        "f85031c0-a6a2-4dca-a707-429ac7a27780|2346b7f2-b69f-40bb-a53c-d8447008fe42",
+        "c74e6156-e4b7-44bf-b068-033bc4511d49|2346b7f2-b69f-40bb-a53c-d8447008fe42",
+        "9b7c1c0c-3093-4aa0-b38d-a0feb8255539|2346b7f2-b69f-40bb-a53c-d8447008fe42",
+        "6099b417-26e6-4842-9780-105081c6511e|2346b7f2-b69f-40bb-a53c-d8447008fe42",
+        "3dd5219a-6921-454c-8127-68278c42d490|2346b7f2-b69f-40bb-a53c-d8447008fe42",
+        "2298a894-911f-47a5-aea7-3cbccdeafbdb|2346b7f2-b69f-40bb-a53c-d8447008fe42",
+        "6da38c64-6ce7-4af2-bf36-1c6a6739caa7|2346b7f2-b69f-40bb-a53c-d8447008fe42",
+        "1ec5b4a6-ca44-4103-8020-b7f2dd0b258c|2346b7f2-b69f-40bb-a53c-d8447008fe42"
+      ]
+    }
+  }
+}
