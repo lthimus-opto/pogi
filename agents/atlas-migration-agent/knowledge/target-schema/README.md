@@ -6,8 +6,8 @@ deliberately kept separate from the others:
 
 | Question | Mechanism | Mutable? |
 | --- | --- | --- |
-| **Where did this come from?** | `ingestion_source` -> `input` -> `provenance` | No -- immutable lineage, never rewritten |
-| **Who owns the write?** | `chain_group_key` | No -- frozen at write time, propagates automatically if corrected upstream |
+| **Where did this come from?** | `ingestion` -> `input` -> `provenance` | No -- immutable lineage, never rewritten |
+| **Who owns the write?** | `source_id` (`source_identity`) | No -- a stable surrogate key, frozen at write time, never corrected in place |
 | **Who is allowed to read?** | `access_group` / `input_grant` | Yes -- a live, versioned, revisable list |
 | **What does this input resolve to?** | `anchor` / `input_anchor` | Append-only -- a new version, never an edit |
 | **How does a mistake get fixed?** | `input_anchor` (remap) / `anchor_status_correction` (status) / `rich_data_correction` (value) | Each is its own mechanism, for a reason |
@@ -21,19 +21,23 @@ overwrite and correct at all.
 ## 1. Lineage: where did this come from?
 
 ```
-ingestion_source  (one write run -- a job, a one-off API hit, a manual upload)
-  -> input        (one record within that run)
-    -> entity_name / entity_identifier / ... (the actual facts)
+source_identity   (one row per distinct (source_type, owner_id) writer slot)
+  -> ingestion    (one write run -- a job, a one-off API hit, a manual upload)
+    -> input      (one record within that run)
+      -> entity_name / entity_identifier / ... (the actual facts)
 ```
 
-- `INGESTION_SOURCE` -- one row per run: `source_type`, `source_subtype` (free text, e.g.
-  `"form_adv_monthly"` vs `"form_adv_daily"`, or which legacy system a `system_migration` run
-  came from -- pure review/diff metadata, never structural: it plays no part in
-  `chain_group_key` or any uniqueness, and isn't duplicated onto any fact table, so two runs
-  with different `source_subtype` but the same `source_type`/`org_id` still chain together as
-  one writer), `org_id` (private sources only), `pipe_type`, `pipe_run_id` (rerun-safety).
+- `SOURCE_IDENTITY` -- one row per writer slot: `source_type`, `owner_id` (private sources
+  only), and the derived `source_visibility`/`access_group` (both properties of the writer,
+  not of any individual run -- see section 2).
+- `INGESTION` -- one row per run: `source_id` (FK into `SOURCE_IDENTITY`), `ingestion_subtype`
+  (free text, e.g. `"form_adv_monthly"` vs `"form_adv_daily"`, or which legacy system a
+  `system_migration` run came from -- pure review/diff metadata, never structural: it plays
+  no part in `source_id` or any uniqueness, and isn't duplicated onto any fact table, so two
+  runs with different `ingestion_subtype` but the same `source_type`/`owner_id` still chain
+  together as one writer), `pipe_type`, `pipe_run_id` (rerun-safety).
 - `INPUT` -- one row per *record* within that run, not per run. This is the real point of
-  `INPUT`: one `INGESTION_SOURCE` can contain many `INPUT`s, and now that each one is its own
+  `INPUT`: one `INGESTION` can contain many `INPUT`s, and now that each one is its own
   addressable row, a single record out of a whole batch can be corrected, or shared with
   another org, without touching any of the others in that same run. Legacy has no equivalent --
   a batch is correctable/shareable only as a whole.
@@ -41,70 +45,82 @@ ingestion_source  (one write run -- a job, a one-off API hit, a manual upload)
   (a PDF, a pitch deck): which page, how confident. A fact read from a clean structured field
   has none, because there's nothing to say.
 
-**Worked example** -- one `INGESTION_SOURCE`, three `INPUT`s, each independently correctable:
+**Worked example** -- one `INGESTION`, three `INPUT`s, each independently correctable:
 ```sql
-INSERT INTO ingestion_source (source_type, source_visibility, pipe_type, recorded_by)
-VALUES ('SEC_EDGAR', 'LICENSED', 'DAGSTER', 'pipe-bot');
+INSERT INTO source_identity (source_type, recorded_by)
+VALUES ('SEC_EDGAR', 'pipe-bot');
+-- source_visibility ('LICENSED') and access_group ('SEC') are both GENERATED off source_type
+-- (see section 3) -- never passed in, never independently settable.
 
-INSERT INTO input (ingestion_source_id, index, anchor_type, access_group, payload, schema_version) VALUES
-  (<source_id>, 0, 'ENTITY', 'SEC', '{"name": "Acme Corp"}', 'v1'),
-  (<source_id>, 1, 'ENTITY', 'SEC', '{"name": "Beta Fund"}', 'v1'),
-  (<source_id>, 2, 'ENTITY', 'SEC', '{"name": "Acme Corp", "identifier": "123-CIK"}', 'v1');
+INSERT INTO ingestion (source_id, ingestion_subtype, pipe_type, recorded_by)
+VALUES (<source_id>, 'edgar_full_text_search', 'DAGSTER', 'pipe-bot');
+
+INSERT INTO input (ingestion_id, index, anchor_type, access_group, payload, schema_version) VALUES
+  (<ingestion_id>, 0, 'ENTITY', 'SEC', '{"name": "Acme Corp"}', 'v1'),
+  (<ingestion_id>, 1, 'ENTITY', 'SEC', '{"name": "Beta Fund"}', 'v1'),
+  (<ingestion_id>, 2, 'ENTITY', 'SEC', '{"name": "Acme Corp", "identifier": "123-CIK"}', 'v1');
 -- all three came from the same run -- correcting or sharing index 2 never touches 0 or 1
 -- access_group is shown here for readability, but it's not an independent choice: it's
--- derived from ingestion_source.source_type/org_id (here, SEC_EDGAR -> 'SEC', see section 3)
--- and the input-insert trigger overwrites whatever value is passed with that derived one.
+-- copied down from source_identity.access_group via ingestion, and the input-insert trigger
+-- overwrites whatever value is passed with that derived one.
 ```
 
 ---
 
-## 2. Write ownership: `chain_group_key`
+## 2. Write ownership: `source_id`
 
 **Whoever wrote a row owns it, full stop.** No "shared ownership" case:
 
 - A `LICENSED` source (SEC, MSCI) is owned by **the source itself** -- there's only one.
 - A `PRIVATE` source (a client upload) is owned by **that source's org** -- the same generic
-  pipe can be reused by many orgs, so `org_id` is what disambiguates.
+  pipe can be reused by many orgs, so `owner_id` is what disambiguates.
 
-`CHAIN_GROUP_KEY` folds that into one opaque, deterministic `UUID`, computed once on
-`INGESTION_SOURCE`:
+`SOURCE_ID` is a real surrogate key, not a derived value -- one row of `SOURCE_IDENTITY` per
+distinct `(source_type, owner_id)` pair:
 
 ```sql
-chain_group_key UUID GENERATED ALWAYS AS (
-    CASE WHEN org_id IS NOT NULL
-        THEN md5(source_type_to_text(source_type) || ':' || org_id::text)::uuid
-        ELSE md5(source_type_to_text(source_type))::uuid
-    END
-) STORED
+CREATE TABLE source_identity (
+    source_id UUID NOT NULL PRIMARY KEY DEFAULT uuidv7(),
+    source_type SOURCE_TYPE NOT NULL,
+    owner_id UUID,
+    source_visibility SOURCE_VISIBILITY GENERATED ALWAYS AS (source_type_to_source_visibility(source_type)) STORED,
+    access_group ACCESS_GROUP GENERATED ALWAYS AS (source_type_to_access_group(source_type, owner_id)) STORED,
+    ...
+    UNIQUE (source_type, owner_id)
+);
 ```
 
-Deliberately opaque (keyed off `org_id`, not a renameable display name) and a real `GENERATED`
-column -- Postgres itself rejects writing to it directly.
+An earlier draft of this design folded `source_type`/`owner_id` into one opaque, deterministic
+`UUID` (`chain_group_key = md5(source_type || ':' || owner_id)`) computed directly on
+`INGESTION_SOURCE`. `SOURCE_ID` replaces that: a *randomly generated* surrogate key is
+actually more opaque than the hash was (the hash was one dictionary attack away from being
+reversed -- `source_type` is a 7-value enum, `owner_id` is enumerable from user_service), and
+being a real FK means Postgres enforces referential integrity instead of every caller having
+to trust that the hash formula was ported correctly everywhere.
 
 **What this avoids**: legacy's equivalent key is a free-text string
 (`ingestion_source_group_key`), with no structural tie to who actually wrote a row -- two
 different orgs both naming their pipe `"manual"` can collide. Worse, legacy's "one open row per
 slot" rule isn't even a real constraint today -- its unique index doesn't cover that case at
-all, so the rule is enforced by application code alone, with no backstop. `CHAIN_GROUP_KEY`
+all, so the rule is enforced by application code alone, with no backstop. `SOURCE_ID`
 closes both gaps: two owners can never land in the same slot, and it's a real `UNIQUE` index,
 not a convention:
 
 ```sql
-CREATE UNIQUE INDEX entity_name_open_slot_idx ON entity_name (entity_id, name_type, chain_group_key)
+CREATE UNIQUE INDEX entity_name_open_slot_idx ON entity_name (entity_id, name_type, source_id)
     WHERE valid_to IS NULL;
 ```
 
-### The cascade
+### No cascade
 
-Correcting `org_id` on an `INGESTION_SOURCE` recomputes its `chain_group_key` automatically, but
-every `INPUT`/fact row underneath it already copied the old value. Two triggers cascade the fix
-down, one hop at a time (`ingestion_source -> input -> every fact table`), touching only rows
-still carrying the stale value.
-
-**The safety net**: the cascade runs through each table's normal `UNIQUE` constraint, not around
-it. If a correction would merge two already-independent, already-open chains, Postgres rejects
-the whole thing, atomically -- a real collision that needs a human, not something to silently
-let one owner overwrite another's row.
+Unlike the hash design, there is no cascade here at all. `SOURCE_ID` is set once, by a
+`BEFORE INSERT` trigger, and never revisited. Fixing a wrong writer identity after the fact is
+not an `UPDATE` on existing rows -- it goes through the ordinary correction/resolution
+mechanism instead: the old `INPUT` row is superseded, a new one is written pointing at the
+right `INGESTION`/`SOURCE_IDENTITY`. The old design needed two `AFTER UPDATE` triggers
+(`ingestion_source -> input -> every fact table`) specifically to retroactively push a
+corrected `owner_id`'s derived values down three hops; that entire mechanism is gone, not
+renamed.
 
 ---
 
@@ -112,11 +128,10 @@ let one owner overwrite another's row.
 
 Orthogonal to ownership -- never consulted for who can overwrite what, only for who can *read*.
 
-- `access_group` -- **not an independent choice.** Derived from `source_type`/`org_id`, same
-  two inputs as `chain_group_key`, computed on `ingestion_source` and copied down to `input`:
+- `access_group` -- **not an independent choice.** Derived from `source_type`/`owner_id`, same
+  two inputs as `source_id`, computed on `source_identity` and copied down to `input`:
   `SEC_ADV`/`SEC_EDGAR` -> `SEC`, `MSCI` -> `MSCI`, `ARCH` -> `ARCH`, `MANUAL`/`PITCH_DECK`/
-  `SYSTEM_MIGRATION` -> `OPTO` if the firm's own org, else `CLIENT`. Correcting `org_id` later
-  cascades a changed `access_group` the same way it cascades `chain_group_key`.
+  `SYSTEM_MIGRATION` -> `OPTO` if the firm's own org, else `CLIENT`.
 - `input_grant` -- the only genuinely independent, mutable entitlement lever, used for the
   `CLIENT` case specifically: a versioned, full-snapshot list of which orgs currently have read
   access:
@@ -131,10 +146,11 @@ Orthogonal to ownership -- never consulted for who can overwrite what, only for 
   );
   ```
   Each version is the entire grant list at that point, not a single add/revoke -- full history,
-  no extra bookkeeping.
+  no extra bookkeeping. (This `org_id` is a different thing from `source_identity.owner_id` --
+  a list of *grantee* orgs, not a writer identity -- deliberately left named `org_id`.)
 
 Granting Org B read access to Org A's row never lets Org B's writes supersede it -- Org B's
-writes still land under Org B's own `chain_group_key`. Revoking the grant later has zero effect
+writes still land under Org B's own `source_id`. Revoking the grant later has zero effect
 on ownership either. The two mechanisms never influence each other, in either direction.
 
 ---

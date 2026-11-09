@@ -17,7 +17,7 @@ CREATE EXTENSION IF NOT EXISTS vector;
 
 CREATE TYPE anchor_type AS ENUM ('ENTITY', 'INSTRUMENT', 'POSITION');
 
--- Which kind of system produced an INGESTION_SOURCE. A real, closed enum, same as legacy's
+-- Which kind of system produced an INGESTION. A real, closed enum, same as legacy's
 -- IngestionSourceType -- new sources are rare and deliberate enough to warrant a migration.
 CREATE TYPE source_type AS ENUM ('ARCH', 'MANUAL', 'MSCI', 'PITCH_DECK', 'SEC_ADV', 'SEC_EDGAR', 'SYSTEM_MIGRATION');
 
@@ -25,14 +25,15 @@ CREATE TYPE source_type AS ENUM ('ARCH', 'MANUAL', 'MSCI', 'PITCH_DECK', 'SEC_AD
 -- straight through the API with no Dagster/Airflow/Lambda job behind it at all.
 CREATE TYPE pipe_type AS ENUM ('DAGSTER', 'AIRFLOW', 'AWS_LAMBDA', 'AD_HOC');
 
--- Determines whether an ingestion source's writer identity needs ORG to disambiguate it when
--- computing CHAIN_GROUP_KEY. PRIVATE sources (an org's own uploads) can be shared by many
--- different orgs through the same generic pipe, so the org is required. LICENSED sources
--- (regulatory filings, licensed vendor feeds) are each inherently a single writer already --
--- there's exactly one SEC, one MSCI -- so no org is needed or allowed.
+-- Determines whether a writer identity (SOURCE_IDENTITY, below) needs OWNER_ID to
+-- disambiguate it. PRIVATE sources (an org's own uploads) can be shared by many different
+-- orgs through the same generic pipe, so the owner is required. LICENSED sources (regulatory
+-- filings, licensed vendor feeds) are each inherently a single writer already -- there's
+-- exactly one SEC, one MSCI -- so no owner is needed or allowed.
 CREATE TYPE source_visibility AS ENUM ('LICENSED', 'PRIVATE');
 
--- Entitlement: who is allowed to *read* a fact/attachment. Orthogonal to chain_group_key.
+-- Entitlement: who is allowed to *read* a fact/attachment. Orthogonal to SOURCE_ID (the
+-- writer-identity key, see SOURCE_IDENTITY below).
 CREATE TYPE access_group AS ENUM ('ARCH', 'OPTO', 'CLIENT', 'SEC', 'MSCI');
 
 CREATE TYPE record_status AS ENUM ('ACTIVE', 'INACTIVE', 'LOGICALLY_DELETED', 'MANUALLY_DELETED', 'TEMPORARY', 'TEST');
@@ -41,13 +42,82 @@ CREATE TYPE record_status AS ENUM ('ACTIVE', 'INACTIVE', 'LOGICALLY_DELETED', 'M
 -- Intake
 -- ============================================================================================
 
--- One write run (a job, a one-off API hit, a manual upload). Named and shaped after legacy's
--- INGESTION_SOURCE, with ORG_ID/SOURCE_VISIBILITY promoted to real, checked columns instead of
--- being inferred from SOURCE_TYPE via an app-level lookup table.
+-- Writer identity, split out into its own table. One row per distinct (SOURCE_TYPE, OWNER_ID)
+-- pair -- the stable "who is writing" slot that used to be reconstructed on every
+-- INGESTION_SOURCE row via a deterministic hash (CHAIN_GROUP_KEY). SOURCE_ID is a real
+-- surrogate key now: randomly generated, never computed from SOURCE_TYPE/OWNER_ID, so there's
+-- nothing for app code or a human to reverse out of it -- stronger opacity than the old hash
+-- gave, which was one dictionary attack away from being reversed (SOURCE_TYPE is a 7-value
+-- enum, OWNER_ID is enumerable from user_service).
 --
--- ORG_ID is not a table Atlas owns -- that registry belongs to user_service. It arrives here
--- as a plain, immutable snapshot captured at write time, same as `source_type` -- never
--- looked up via a local join.
+-- OWNER_ID (earlier drafts of this file called it ORG_ID) is not a table Atlas owns -- that
+-- registry belongs to user_service. It arrives here as a plain, immutable snapshot captured
+-- at write time, same as `source_type` -- never looked up via a local join.
+--
+-- SOURCE_VISIBILITY/ACCESS_GROUP both live here, not on INGESTION below: both are derived
+-- purely from SOURCE_TYPE (+ OWNER_ID for ACCESS_GROUP), which makes them properties of the
+-- *writer*, not of any individual ingestion run.
+--
+-- SOURCE_VISIBILITY is GENERATED off SOURCE_TYPE, not an independently-settable column --
+-- settles what was an open question on the old design: a mismatched SOURCE_VISIBILITY/
+-- SOURCE_TYPE pair could otherwise produce a writer slot with no OWNER_ID folded in, silently
+-- merging every org's private data under one SOURCE_TYPE into one slot.
+CREATE OR REPLACE FUNCTION source_type_to_source_visibility(value SOURCE_TYPE) RETURNS SOURCE_VISIBILITY AS $$
+    SELECT CASE
+        WHEN value IN ('SEC_ADV', 'SEC_EDGAR', 'MSCI', 'ARCH') THEN 'LICENSED'::source_visibility
+        ELSE 'PRIVATE'::source_visibility
+    END;
+$$ LANGUAGE sql IMMUTABLE;
+
+-- ACCESS_GROUP is derived, never independently chosen -- ported directly from legacy's
+-- `get_source_entitlement_group`, the "single point of truth" function legacy's own code
+-- warns never to edit without sign-off from the entitlements/data-access owners. Same two
+-- inputs as SOURCE_VISIBILITY (SOURCE_TYPE + OWNER_ID), same reasoning: if it's derived from
+-- the same facts every time, it shouldn't also be a free column the app can set to anything.
+-- OPTO_ORG_ID is legacy's actual hardcoded constant (the firm's own org id) -- kept as the
+-- same literal, not re-derived or looked up, matching legacy exactly.
+CREATE OR REPLACE FUNCTION source_type_to_access_group(value SOURCE_TYPE, owner UUID) RETURNS ACCESS_GROUP AS $$
+    SELECT CASE
+        WHEN value IN ('SEC_ADV', 'SEC_EDGAR') THEN 'SEC'::access_group
+        WHEN value = 'MSCI' THEN 'MSCI'::access_group
+        WHEN value = 'ARCH' THEN 'ARCH'::access_group
+        WHEN value IN ('MANUAL', 'PITCH_DECK', 'SYSTEM_MIGRATION') THEN
+            CASE WHEN owner = '2346b7f2-b69f-40bb-a53c-d8447008fe42'::uuid
+                THEN 'OPTO'::access_group
+                ELSE 'CLIENT'::access_group
+            END
+    END;
+$$ LANGUAGE sql IMMUTABLE;
+
+-- UNIQUE (source_type, owner_id) alone isn't enough to dedupe LICENSED writers: OWNER_ID is
+-- NULL for every LICENSED source ("there's exactly one SEC"), and standard SQL treats every
+-- NULL as distinct, so two SOURCE_IDENTITY rows could otherwise both be ('SEC_ADV', NULL).
+-- The partial index below closes that gap; the plain UNIQUE constraint still covers the
+-- PRIVATE/non-null case.
+CREATE TABLE source_identity (
+    source_id UUID NOT NULL PRIMARY KEY DEFAULT uuidv7(),
+    source_type SOURCE_TYPE NOT NULL,
+    owner_id UUID,
+    source_visibility SOURCE_VISIBILITY GENERATED ALWAYS AS (source_type_to_source_visibility(source_type)) STORED,
+    access_group ACCESS_GROUP GENERATED ALWAYS AS (source_type_to_access_group(source_type, owner_id)) STORED,
+    recorded_by TEXT NOT NULL,
+    recorded_at TIMESTAMP NOT NULL DEFAULT (now() AT TIME ZONE 'UTC'),
+
+    UNIQUE (source_type, owner_id),
+    CHECK ((source_visibility = 'PRIVATE') = (owner_id IS NOT NULL))
+);
+CREATE UNIQUE INDEX source_identity_licensed_idx ON source_identity (source_type) WHERE owner_id IS NULL;
+
+-- One write run (a job, a one-off API hit, a manual upload). What's left here once
+-- SOURCE_TYPE/OWNER_ID/SOURCE_VISIBILITY/ACCESS_GROUP move to SOURCE_IDENTITY above: just the
+-- per-run facts -- which writer slot this run belongs to (SOURCE_ID, a real FK, never
+-- recomputed), and how/when this particular run happened.
+--
+-- SOURCE_ID is stable and never changes once written -- there is deliberately no cascade
+-- mechanism anywhere in this file for it. Fixing a wrong writer identity after the fact is
+-- not an UPDATE on existing rows; it goes through the same correction/resolution mechanism as
+-- every other wrong fact in this schema -- the old INPUT row gets superseded, a new one is
+-- written pointing at the right INGESTION/SOURCE_IDENTITY, through the ordinary create path.
 --
 -- PIPE_RUN_ID is never null -- every write traces back to *something* that ran it, even if
 -- that's just "this one API call" (PIPE_TYPE = AD_HOC), in which case it defaults to a fresh
@@ -57,65 +127,20 @@ CREATE TYPE record_status AS ENUM ('ACTIVE', 'INACTIVE', 'LOGICALLY_DELETED', 'M
 -- SOURCE_EXTERNAL_KEY it's never redundant with itself (legacy's own pipes passed the exact
 -- same `run_id` into both fields in some call sites).
 --
--- CHAIN_GROUP_KEY is this ingestion source's writer identity, folded into its SOURCE_TYPE as
--- one opaque, deterministic UUID -- a hash of `source_type` (+ `org_id`, for PRIVATE),
--- computed straight off this same row, no trigger needed:
---   - PRIVATE -> md5(source_type || ':' || org_id)::uuid
---   - LICENSED -> md5(source_type)::uuid -- the source is already a unique writer, nothing
---     to fold in
--- Deliberately opaque, not human-readable -- keying off ORG_ID, not a user_service-owned
--- display name, is the whole point. `source_type`/`org_id` stay around as plain columns for
--- that -- join back here when a human needs to read "whose chain is this."
---
--- SOURCE_TYPE_TO_TEXT exists purely so the GENERATED expression below can call it: Postgres
--- treats an enum's own `::text` cast as STABLE, not IMMUTABLE (a long-standing quirk of
--- enum_out), so it can't be used directly inside a generated column. Wrapping it in our own
--- function we declare IMMUTABLE ourselves sidesteps that -- same trick as `sort_name_words`
--- elsewhere in this file.
-CREATE OR REPLACE FUNCTION source_type_to_text(value SOURCE_TYPE) RETURNS TEXT AS $$
-    SELECT value::text;
-$$ LANGUAGE sql IMMUTABLE;
-
--- ACCESS_GROUP is derived, never independently chosen -- ported directly from legacy's
--- `get_source_entitlement_group`, the "single point of truth" function legacy's own code
--- warns never to edit without sign-off from the entitlements/data-access owners. Same two
--- inputs as CHAIN_GROUP_KEY (SOURCE_TYPE + ORG_ID), same reasoning: if it's derived from the
--- same facts every time, it shouldn't also be a free column the app can set to anything.
--- OPTO_ORG_ID is legacy's actual hardcoded constant (the firm's own org id) -- kept as the
--- same literal, not re-derived or looked up, matching legacy exactly.
-CREATE OR REPLACE FUNCTION source_type_to_access_group(value SOURCE_TYPE, org UUID) RETURNS ACCESS_GROUP AS $$
-    SELECT CASE
-        WHEN value IN ('SEC_ADV', 'SEC_EDGAR') THEN 'SEC'::access_group
-        WHEN value = 'MSCI' THEN 'MSCI'::access_group
-        WHEN value = 'ARCH' THEN 'ARCH'::access_group
-        WHEN value IN ('MANUAL', 'PITCH_DECK', 'SYSTEM_MIGRATION') THEN
-            CASE WHEN org = '2346b7f2-b69f-40bb-a53c-d8447008fe42'::uuid
-                THEN 'OPTO'::access_group
-                ELSE 'CLIENT'::access_group
-            END
-    END;
-$$ LANGUAGE sql IMMUTABLE;
-
-CREATE TABLE ingestion_source (
-    ingestion_source_id UUID NOT NULL PRIMARY KEY DEFAULT uuidv7(),
-    source_type SOURCE_TYPE NOT NULL,
-    source_subtype TEXT NOT NULL,
-    source_visibility SOURCE_VISIBILITY NOT NULL,
-    org_id UUID,
+-- INGESTION_SUBTYPE (earlier drafts called it SOURCE_SUBTYPE/GROUP_KEY) is free text, one
+-- static value per pipe, deliberately excluded from SOURCE_ID/uniqueness -- pure review/diff
+-- metadata, not a structural key (see `../CHANGELOG.md`, Phase 0 row, for why it's kept at
+-- all).
+CREATE TABLE ingestion (
+    ingestion_id UUID NOT NULL PRIMARY KEY DEFAULT uuidv7(),
+    source_id UUID NOT NULL REFERENCES source_identity (source_id),
+    ingestion_subtype TEXT NOT NULL,
     pipe_type PIPE_TYPE NOT NULL,
     pipe_run_id TEXT NOT NULL DEFAULT gen_random_uuid()::text,
-    chain_group_key UUID GENERATED ALWAYS AS (
-        CASE WHEN org_id IS NOT NULL
-            THEN md5(source_type_to_text(source_type) || ':' || org_id::text)::uuid
-            ELSE md5(source_type_to_text(source_type))::uuid
-        END
-    ) STORED,
-    access_group ACCESS_GROUP GENERATED ALWAYS AS (source_type_to_access_group(source_type, org_id)) STORED,
     recorded_by TEXT NOT NULL,
     recorded_at TIMESTAMP NOT NULL DEFAULT (now() AT TIME ZONE 'UTC'),
 
-    UNIQUE (chain_group_key, pipe_run_id),
-    CHECK ((source_visibility = 'PRIVATE') = (org_id IS NOT NULL))
+    UNIQUE (source_id, pipe_run_id)
 );
 
 -- ============================================================================================
@@ -123,7 +148,7 @@ CREATE TABLE ingestion_source (
 -- ============================================================================================
 
 -- NOT lineage. Lineage (which write produced a fact, through what source/org/pipe, when) is
--- universal -- every fact has it, via INGESTION_SOURCE/INPUT below. PROVENANCE is optional and
+-- universal -- every fact has it, via INGESTION/SOURCE_IDENTITY/INPUT below. PROVENANCE is optional and
 -- much narrower: it only ever gets populated when a fact was pulled out of an unstructured
 -- document -- a PDF, a pitch deck, a spreadsheet -- via parsing/extraction, and records
 -- *where in that document* (page/sheet/row/column) and *how confidently* (confidence/
@@ -162,36 +187,38 @@ CREATE TABLE provenance (
 -- exactly the kind of granularity mismatch PROVENANCE_ID is supposed to avoid. Provenance only
 -- means something at the grain of one atomic claim -- that's each fact table below, not INPUT.
 --
--- CHAIN_GROUP_KEY/ACCESS_GROUP here are a straight, one-hop copy of the owning
--- INGESTION_SOURCE's already-finalized values -- set once by a trigger at insert time, never
--- recomputed, never settable directly by app code (same reasoning for both: both are derived
--- from SOURCE_TYPE/ORG_ID, neither is an independent choice). CHAIN_GROUP_KEY gets copied
--- again, one more hop, to every fact table below -- see `set_chain_columns` further down.
--- ACCESS_GROUP stops here; it's a per-INPUT fact, nothing downstream needs its own copy.
+-- SOURCE_ID/ACCESS_GROUP here are a straight, one-hop copy of the owning INGESTION's
+-- SOURCE_IDENTITY row -- set once by a trigger at insert time, never recomputed, never
+-- settable directly by app code (same reasoning for both: both are derived from SOURCE_TYPE/
+-- OWNER_ID, neither is an independent choice). SOURCE_ID gets copied again, one more hop, to
+-- every fact table below -- see `set_source_id` further down -- and it's a real FK now, not
+-- an opaque hash, so Postgres itself enforces that it points at a real writer. ACCESS_GROUP
+-- stops here; it's a per-INPUT fact, nothing downstream needs its own copy.
 --
--- AS_OF lives here, not on INGESTION_SOURCE -- a single ingest (one batch upload) can easily
+-- AS_OF lives here, not on INGESTION -- a single ingest (one batch upload) can easily
 -- contain items from different reporting periods, so it's a per-item fact, not a per-batch
 -- one. Nullable -- not every input has a meaningful business-as-of date.
 CREATE TABLE input (
     input_id UUID NOT NULL PRIMARY KEY DEFAULT uuidv7(),
-    ingestion_source_id UUID NOT NULL REFERENCES ingestion_source (ingestion_source_id),
+    ingestion_id UUID NOT NULL REFERENCES ingestion (ingestion_id),
     index INTEGER NOT NULL,
     anchor_type ANCHOR_TYPE NOT NULL,
     access_group ACCESS_GROUP NOT NULL,
     as_of DATE,
-    chain_group_key UUID NOT NULL,
+    source_id UUID NOT NULL REFERENCES source_identity (source_id),
     payload JSONB NOT NULL,
     schema_version TEXT NOT NULL,
     recorded_at TIMESTAMP NOT NULL DEFAULT (now() AT TIME ZONE 'UTC'),
 
     UNIQUE (anchor_type, input_id),
-    UNIQUE (ingestion_source_id, index)
+    UNIQUE (ingestion_id, index)
 );
 
 CREATE OR REPLACE FUNCTION set_input_derived_columns() RETURNS TRIGGER AS $$
 BEGIN
-    SELECT chain_group_key, access_group INTO NEW.chain_group_key, NEW.access_group
-      FROM ingestion_source WHERE ingestion_source_id = NEW.ingestion_source_id;
+    SELECT i.source_id, si.access_group INTO NEW.source_id, NEW.access_group
+      FROM ingestion i JOIN source_identity si ON si.source_id = i.source_id
+     WHERE i.ingestion_id = NEW.ingestion_id;
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
@@ -200,40 +227,24 @@ CREATE TRIGGER input_set_derived_columns
     BEFORE INSERT ON input
     FOR EACH ROW EXECUTE FUNCTION set_input_derived_columns();
 
--- A correction to an old INGESTION_SOURCE's `org_id` (e.g. fixing a wrong `org_id` after the
--- fact) changes `chain_group_key` AND `access_group` on that row automatically -- both are
--- GENERATED columns, see above. But every INPUT already written under that ingestion source
--- copied the *old* values at insert time, and would otherwise silently keep them forever,
--- going stale. This trigger is the retroactive half: it pushes changed values down to every
--- INPUT row still carrying a stale one. See `cascade_input_chain_group_key` further down for
--- the next hop, from INPUT down to every fact table (CHAIN_GROUP_KEY only -- ACCESS_GROUP has
--- nowhere further to go).
-CREATE OR REPLACE FUNCTION cascade_ingestion_source_derived_columns() RETURNS TRIGGER AS $$
-BEGIN
-    IF NEW.chain_group_key IS DISTINCT FROM OLD.chain_group_key
-       OR NEW.access_group IS DISTINCT FROM OLD.access_group THEN
-        UPDATE input SET chain_group_key = NEW.chain_group_key, access_group = NEW.access_group
-         WHERE ingestion_source_id = NEW.ingestion_source_id
-           AND (chain_group_key IS DISTINCT FROM NEW.chain_group_key
-                OR access_group IS DISTINCT FROM NEW.access_group);
-    END IF;
-    RETURN NULL;
-END;
-$$ LANGUAGE plpgsql;
-
-CREATE TRIGGER ingestion_source_cascade_derived_columns
-    AFTER UPDATE ON ingestion_source
-    FOR EACH ROW EXECUTE FUNCTION cascade_ingestion_source_derived_columns();
+-- No retroactive cascade here, unlike the old design -- SOURCE_ID is a stable surrogate key,
+-- never recomputed from mutable fields, so there's nothing to push downstream when a writer
+-- identity turns out to be wrong. Fixing that goes through the ordinary correction/
+-- resolution mechanism instead: supersede the old INPUT row, write a new one pointing at the
+-- right INGESTION/SOURCE_IDENTITY. No AFTER UPDATE trigger, no UPDATE-driven cascade,
+-- anywhere in this chain.
 
 -- Which orgs currently have read access to an input's data. Versioned full-snapshot, same
 -- rationale as schema.sql. This is ENTITLEMENT, not ownership -- it's never consulted for
--- chain_group_key/supersession, and changing it never changes who can overwrite what. It can
+-- source_id/supersession, and changing it never changes who can overwrite what. It can
 -- be revised (shared, then un-shared) at any time without touching the fact rows it governs.
 --
 -- Distinct from ACCESS_GROUP, which isn't a knob at all -- it's derived from SOURCE_TYPE/
--- ORG_ID (see INGESTION_SOURCE above), same as CHAIN_GROUP_KEY. INPUT_GRANT is the only
+-- OWNER_ID (see SOURCE_IDENTITY above), same as SOURCE_ID. INPUT_GRANT is the only
 -- genuinely independent, mutable entitlement lever -- used for the CLIENT case specifically,
--- to share a client's otherwise-private data with other named orgs.
+-- to share a client's otherwise-private data with other named orgs. Its own `org_id` column
+-- is a different thing from SOURCE_IDENTITY.owner_id -- a list of *grantee* orgs, not a
+-- writer identity -- deliberately left named `org_id`, not renamed to match.
 CREATE TABLE input_grant (
     input_id UUID NOT NULL REFERENCES input (input_id),
     version INTEGER NOT NULL,
@@ -251,17 +262,18 @@ CREATE TABLE input_grant (
 -- `identifier_type` below is a plain TEXT column here, with no FK, as a result.
 
 -- ============================================================================================
--- Chain-group-key propagation -- the structural fix for the write-ownership bug
+-- Source-id propagation -- the structural fix for the write-ownership bug
 -- ============================================================================================
 
--- Every fact table below carries `chain_group_key`, always populated by this trigger as a
--- straight one-hop copy from the INPUT behind the row's `input_id` -- never settable directly
--- by app code. The "one open row per slot" unique index on each fact table keys on this single
--- column, so two different writers (two orgs, or an org vs. a licensed source) can never
--- collide, no matter what source_type either of them shares.
-CREATE OR REPLACE FUNCTION set_chain_columns() RETURNS TRIGGER AS $$
+-- Every fact table below carries `source_id`, always populated by this trigger as a straight
+-- one-hop copy from the INPUT behind the row's `input_id` -- never settable directly by app
+-- code, and a real FK into SOURCE_IDENTITY, not an opaque hash. The "one open row per slot"
+-- unique index on each fact table keys on this single column, so two different writers (two
+-- orgs, or an org vs. a licensed source) can never collide, no matter what source_type either
+-- of them shares.
+CREATE OR REPLACE FUNCTION set_source_id() RETURNS TRIGGER AS $$
 BEGIN
-    SELECT chain_group_key INTO NEW.chain_group_key FROM input WHERE input_id = NEW.input_id;
+    SELECT source_id INTO NEW.source_id FROM input WHERE input_id = NEW.input_id;
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
@@ -335,21 +347,21 @@ CREATE TABLE input_resolution_attempt (
 -- whatever a specific pipeline/vendor uses *internally* to mean "same real-world thing" within
 -- its own feed, a weaker but still useful same-source dedup signal. Legacy scoped its
 -- uniqueness by (silver_id, ingestion_source_group_key, scoped_to) -- GROUP_KEY doesn't exist
--- in this schema anymore, so CHAIN_GROUP_KEY (already the structural stand-in for "which
+-- in this schema anymore, so SOURCE_ID (already the structural stand-in for "which
 -- writer/pipeline produced this") takes over that role instead: a given SILVER_ID is only
--- meaningful for dedup *within* the same CHAIN_GROUP_KEY, never compared across writers.
+-- meaningful for dedup *within* the same SOURCE_ID, never compared across writers.
 CREATE TABLE input_silver_identifier (
     silver_identifier_id UUID NOT NULL PRIMARY KEY DEFAULT uuidv7(),
     input_id UUID NOT NULL REFERENCES input (input_id),
     silver_id CITEXT NOT NULL,
-    chain_group_key UUID NOT NULL,
+    source_id UUID NOT NULL REFERENCES source_identity (source_id),
     recorded_at TIMESTAMP NOT NULL DEFAULT (now() AT TIME ZONE 'UTC'),
 
-    UNIQUE (chain_group_key, silver_id)
+    UNIQUE (source_id, silver_id)
 );
-CREATE TRIGGER input_silver_identifier_set_chain_columns
+CREATE TRIGGER input_silver_identifier_set_source_id
     BEFORE INSERT OR UPDATE OF input_id ON input_silver_identifier
-    FOR EACH ROW EXECUTE FUNCTION set_chain_columns();
+    FOR EACH ROW EXECUTE FUNCTION set_source_id();
 
 -- An anchor considered (and scored) as a possible match during an attempt. Column names
 -- drop the redundant CANDIDATE_/CANDIDATE_MATCH_ prefix legacy's RESOLUTION_STAGING used
@@ -486,9 +498,9 @@ CREATE INDEX input_anchor_current_by_anchor_idx ON input_anchor (anchor_id) WHER
 -- same distinction legacy draws, to keep "this fact was first written" and "this fact was
 -- later corrected" visually distinct at a glance.
 --
--- INPUT_ID, not INGESTION_SOURCE_ID -- same fix as RICH_DATA_CORRECTION below: every write in
--- this file traces to an INPUT, never directly to an INGESTION_SOURCE (that's always one hop
--- further up, via INPUT.ingestion_source_id). Nullable, matching legacy (not every status
+-- INPUT_ID, not INGESTION_ID -- same fix as RICH_DATA_CORRECTION below: every write in
+-- this file traces to an INPUT, never directly to an INGESTION (that's always one hop
+-- further up, via INPUT.ingestion_id). Nullable, matching legacy (not every status
 -- correction is tied to a specific input -- e.g. an ops action taken on an anchor as a whole,
 -- with no single input driving it).
 CREATE TABLE anchor_status_correction (
@@ -537,18 +549,18 @@ CREATE INDEX anchor_status_correction_anchor_idx ON anchor_status_correction (an
 -- legacy exactly: a rich-data correction requires a real human identity, a resolution-side
 -- correction doesn't.
 --
--- INPUT_ID, not INGESTION_SOURCE_ID -- a correction is a write, same as everything else in
+-- INPUT_ID, not INGESTION_ID -- a correction is a write, same as everything else in
 -- this file, so it goes through the same front door: a real INPUT row (SOURCE_TYPE = MANUAL,
 -- PIPE_TYPE = AD_HOC) carries the correction's payload, and this points at it. This also
 -- means the new ENTITY_NAME/ENTITY_IDENTIFIER row this correction writes (CORRECTING_ROW_ID)
 -- gets a real, non-null INPUT_ID of its own -- no special-cased NULL, unlike legacy's
 -- RICH_DATA_CORRECTION, which has to write its corrected ENTITY_ATTRIBUTE row with
 -- input_id=None since it has nothing better to point to. A real INPUT_ID here also means
--- CHAIN_GROUP_KEY propagates to that row through the ordinary `set_chain_columns` trigger,
+-- SOURCE_ID propagates to that row through the ordinary `set_source_id` trigger,
 -- same path every other fact table's write already goes through -- no bespoke plumbing
--- needed just for corrections. INGESTION_SOURCE_ID itself is never stored directly, same as
+-- needed just for corrections. INGESTION_ID itself is never stored directly, same as
 -- every other table here once INPUT_ID is present -- it's always one hop away via
--- INPUT.ingestion_source_id.
+-- INPUT.ingestion_id.
 --
 -- ANCHOR_ID/ANCHOR_TYPE still stay as their own explicit columns, though, unlike the normal
 -- resolution path -- the one deliberate asymmetry worth calling out here. A correction's
@@ -602,7 +614,7 @@ CREATE TABLE entity (
 -- just got it wrong from the start. There's no date on which it "stopped" being true, so
 -- closing it with VALID_TO would be recording a fact that never happened. Deleting it outright
 -- is the honest move -- and since deleting a row from the middle of a (ENTITY_ID, NAME_TYPE,
--- CHAIN_GROUP_KEY) temporal chain can leave a gap, the surviving rows in that same slot (if
+-- SOURCE_ID) temporal chain can leave a gap, the surviving rows in that same slot (if
 -- any, from other inputs under the same writer) get their own VALID_FROM/VALID_TO recomputed
 -- first, so the remaining chain still connects cleanly.
 --
@@ -619,26 +631,25 @@ CREATE TABLE entity_name (
     valid_from DATE NOT NULL,
     valid_to DATE,
     input_id UUID NOT NULL REFERENCES input (input_id),
-    chain_group_key UUID NOT NULL,
+    source_id UUID NOT NULL REFERENCES source_identity (source_id),
     provenance_id UUID REFERENCES provenance (provenance_id),
     recorded_at TIMESTAMP NOT NULL DEFAULT (now() AT TIME ZONE 'UTC')
 );
 
-CREATE TRIGGER entity_name_set_chain_columns
+CREATE TRIGGER entity_name_set_source_id
     BEFORE INSERT OR UPDATE OF input_id ON entity_name
-    FOR EACH ROW EXECUTE FUNCTION set_chain_columns();
+    FOR EACH ROW EXECUTE FUNCTION set_source_id();
 -- One open row per (entity, name_type, writer) -- the actual fix: two different writers (two
 -- orgs, or an org vs. a licensed source) sharing the same source_type still get two
--- independent slots, because their chain_group_key values differ structurally -- never one.
-CREATE UNIQUE INDEX entity_name_open_slot_idx ON entity_name (entity_id, name_type, chain_group_key)
+-- independent slots, because their source_id values differ structurally -- never one.
+CREATE UNIQUE INDEX entity_name_open_slot_idx ON entity_name (entity_id, name_type, source_id)
     WHERE valid_to IS NULL;
 CREATE INDEX entity_name_trgm_idx ON entity_name USING gin (upper(name::text) gin_trgm_ops);
-CREATE INDEX entity_name_embedding_hnsw_idx ON entity_name USING hnsw (embedding vector_cosine_ops);
 
 -- Same hard-delete-on-correction behavior as ENTITY_NAME above (see that table's comment) --
 -- a resolution correction removes the wrong row outright, never VALID_TO, with the same
 -- temporal-chain repair for any surviving rows in the affected (ENTITY_ID, IDENTIFIER_TYPE,
--- CHAIN_GROUP_KEY) slot.
+-- SOURCE_ID) slot.
 CREATE TABLE entity_identifier (
     identifier_id UUID NOT NULL PRIMARY KEY DEFAULT uuidv7(),
     entity_id UUID NOT NULL REFERENCES entity (entity_id),
@@ -647,15 +658,15 @@ CREATE TABLE entity_identifier (
     valid_from DATE NOT NULL,
     valid_to DATE,
     input_id UUID NOT NULL REFERENCES input (input_id),
-    chain_group_key UUID NOT NULL,
+    source_id UUID NOT NULL REFERENCES source_identity (source_id),
     provenance_id UUID REFERENCES provenance (provenance_id),
     recorded_at TIMESTAMP NOT NULL DEFAULT (now() AT TIME ZONE 'UTC')
 );
-CREATE TRIGGER entity_identifier_set_chain_columns
+CREATE TRIGGER entity_identifier_set_source_id
     BEFORE INSERT OR UPDATE OF input_id ON entity_identifier
-    FOR EACH ROW EXECUTE FUNCTION set_chain_columns();
+    FOR EACH ROW EXECUTE FUNCTION set_source_id();
 CREATE UNIQUE INDEX entity_identifier_open_slot_idx
-    ON entity_identifier (entity_id, identifier_type, chain_group_key)
+    ON entity_identifier (entity_id, identifier_type, source_id)
     WHERE valid_to IS NULL;
 CREATE INDEX entity_identifier_lookup_idx ON entity_identifier (identifier_type, identifier);
 
@@ -725,28 +736,9 @@ CREATE TABLE entity_embedding (
 CREATE INDEX entity_embedding_active_idx ON entity_embedding (entity_id, embedding_type, is_active);
 CREATE INDEX entity_embedding_hnsw_idx ON entity_embedding USING hnsw (embedding vector_cosine_ops);
 
--- Second (and last) hop of the retroactive cascade started by
--- `cascade_ingestion_source_chain_group_key` above: once an INPUT's chain_group_key has been pushed to
--- the corrected value, push it one more hop down to every fact-table row written under that
--- INPUT. In the full schema.sql this function lists every fact table explicitly (nine, as of
--- writing) -- here, scoped to this file's two fact tables, ENTITY_NAME and
--- ENTITY_IDENTIFIER, so the pattern is easy to read with more than one table but still small.
--- Same safety property either way: if correcting chain_group_key would collide an open row
--- with another row that already legitimately holds that (entity, slot, chain_group_key)
--- combination, Postgres raises a constraint violation and the whole correction is rolled
--- back.
-CREATE OR REPLACE FUNCTION cascade_input_chain_group_key() RETURNS TRIGGER AS $$
-BEGIN
-    IF NEW.chain_group_key IS DISTINCT FROM OLD.chain_group_key THEN
-        UPDATE entity_name SET chain_group_key = NEW.chain_group_key
-         WHERE input_id = NEW.input_id AND chain_group_key IS DISTINCT FROM NEW.chain_group_key;
-        UPDATE entity_identifier SET chain_group_key = NEW.chain_group_key
-         WHERE input_id = NEW.input_id AND chain_group_key IS DISTINCT FROM NEW.chain_group_key;
-    END IF;
-    RETURN NULL;
-END;
-$$ LANGUAGE plpgsql;
-
-CREATE TRIGGER input_cascade_chain_group_key
-    AFTER UPDATE ON input
-    FOR EACH ROW EXECUTE FUNCTION cascade_input_chain_group_key();
+-- Note, for anyone looking for the equivalent of legacy's `cascade_input_chain_group_key`:
+-- there is deliberately no such trigger here. SOURCE_ID is a stable surrogate key, set once
+-- at insert time via `set_source_id` above and never recomputed, so there's nothing to
+-- retroactively push down a chain for. Fixing a wrong writer identity goes through the
+-- ordinary correction/resolution mechanism instead (supersede the old row, write a new one) --
+-- not a bespoke UPDATE-driven cascade.

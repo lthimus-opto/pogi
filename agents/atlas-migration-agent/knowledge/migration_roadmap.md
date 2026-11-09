@@ -27,12 +27,16 @@ original proposal.
 
 **But `target-schema/` is kept up to date with every *confirmed* fix
 found during this migration — see "The plan will change" section
-above and `target-schema/CHANGELOG.md`.** Three fixes already went
+above and `target-schema/CHANGELOG.md`.** Several fixes already went
 through that confirmation step and are already applied directly in
 `target-schema/schema-basic.sql` (not just noted here in prose):
-`anchor.anchor_id` uses `uuidv7()`, `ingestion_source`'s rerun-safety
-constraint is keyed on `chain_group_key` not bare `source_type`, and
-`entity_name` no longer carries embedding columns. Check
+`anchor.anchor_id` uses `uuidv7()`, `entity_name` no longer carries
+embedding columns, and the old `ingestion_source.chain_group_key`
+(a `GENERATED` hash) has been replaced entirely by a real dimension
+table, `source_identity` (`source_id` surrogate PK, keyed by
+`source_type`/`owner_id`), with `ingestion_source` itself renamed
+`ingestion` and trimmed to per-run facts only; rerun-safety is now
+`UNIQUE (source_id, pipe_run_id)` on `ingestion`. Check
 `target-schema/CHANGELOG.md` for the full list and the reasoning behind
 each, including the ones still open and *not yet* applied (don't assume
 the "Resolved/Pending" lists per phase below are the only place these
@@ -115,7 +119,7 @@ itself — stop and report it rather than picking one side.
 | Phase | What changes | Risk | Depends on |
 |---|---|---|---|
 | 0 | Reconciliation only — no schema change | None (read-only against replica) | — |
-| 1 | `chain_group_key` / `access_group` / `source_visibility` on `ingestion_source` + fact tables | Low, self-contained | Phase 0 clean |
+| 1 | `source_identity` / `ingestion` (renamed from `ingestion_source`) / `source_id` / `access_group` / `source_visibility` on fact tables | Low, self-contained | Phase 0 clean |
 | 2 | `input_grant` table + read-path wiring | Low (additive), Medium once wired into reads | Phase 1 shipped |
 | 3a | `anchor` / `input` / `input_resolution_attempt` / `input_resolution_candidate` / `input_anchor` — new tables, backfilled, dual-written | High (data reconstruction) | Phase 1 shipped |
 | 3b | Cut over **entity** reads to new tables | High | 3a verified clean for a real bake-in window |
@@ -132,11 +136,18 @@ columns would agree with what's in production today — before writing
 a single line of DDL.
 
 **What to do:**
-- Against the replica, compute what `chain_group_key` *would* be for
-  every existing `ingestion_source` row
-  (`md5(source_type || ':' || org_id)` for rows with `org_id`,
-  `md5(source_type)` otherwise) and diff against the current free-text
+- Against the replica, compute what `source_id` *would* be for every
+  existing `ingestion_source` row — i.e. the distinct `(source_type,
+  org_id)` pairs that would each become one `source_identity` row — and
+  diff the resulting grouping against the current free-text
   `ingestion_source_group_key` values actually in use on fact tables.
+  (Earlier drafts of this roadmap framed this as reconciling a
+  deterministic hash, `md5(source_type || ':' || org_id)`; the hash
+  itself has since been dropped in favor of a real `source_identity`
+  dimension table — see the Phase 1 deep-dive row in
+  `target-schema/CHANGELOG.md` — but the grouping this step verifies is
+  unchanged: same two inputs, same question of "do these two rows
+  belong to the same writer.")
 - Compute what `access_group` *would* be via the SQL port of
   `get_source_entitlement_group` (see `app/utils/entitlement_utils.py`
   in `atlas-service`) and diff against the existing
@@ -144,7 +155,7 @@ a single line of DDL.
 - Check for existing constraint violations the *new* mechanism would
   introduce: are there currently two "open" (`valid_to IS NULL`) rows
   for the same `(entity_id, name_type)` (and identifier/other fact
-  tables) that would collide once keyed by the new `chain_group_key`
+  tables) that would collide once keyed by the new `source_id`
   instead of the old free-text key? This is the check that tells you
   whether Phase 1's unique index can even be added without first
   triaging bad data.
@@ -159,36 +170,68 @@ assumed, and a human needs to see that before Phase 1 writes any DDL.
 
 ---
 
-## Phase 1 — `chain_group_key` / `access_group` / `source_visibility`
+## Phase 1 — `source_identity` / `ingestion` / `source_id` / `access_group` / `source_visibility`
 
-**What changes:**
-- `ingestion_source` gains `source_visibility`, `chain_group_key`,
-  `access_group`, and `source_subtype` as described in `schema-basic.sql`
-  — **except**: `source_visibility` must be `GENERATED ALWAYS AS (...) STORED` off
-  `source_type`, **not** a free column. (Open decision, resolved below
-  — do not implement it as a plain column.) `source_subtype` (`TEXT NOT NULL`,
-  the renamed `group_key`) is a plain column, not generated, and deliberately
-  plays no part in `chain_group_key` or any uniqueness — pure review/diff
-  metadata, confirmed during Phase 0, see `target-schema/CHANGELOG.md`.
+**What changes — superseded design, confirmed during the Phase 1 deep-dive (see
+`target-schema/CHANGELOG.md`, "Phase 1 deep-dive" row, for the full before/after and reasoning):**
+- The old plan computed `chain_group_key` as a `GENERATED` hash
+  (`md5(source_type || ':' || org_id)`) directly on `ingestion_source`.
+  That's gone. Instead:
+  - New table **`source_identity`**: one row per distinct
+    `(source_type, owner_id)` writer slot, with a real random
+    surrogate `source_id` PK (not derived from `source_type`/`owner_id`
+    by any formula), plus `source_visibility` and `access_group` as
+    `GENERATED` columns off those same two inputs — both moved here
+    from `ingestion_source` since there's nothing left on the renamed
+    `ingestion` table to derive them from.
+  - **`ingestion_source` is renamed `ingestion`**, trimmed to per-run
+    facts only: `source_id` (FK into `source_identity`),
+    `ingestion_subtype` (renamed from `source_subtype`, same free-text
+    review/diff-metadata role, still no structural part in uniqueness),
+    `pipe_type`, `pipe_run_id`.
+  - `owner_id` is the renamed `org_id` on this new table only —
+    `input_grant.org_id` (a list of *grantee* orgs, unrelated concept)
+    is untouched.
 - Each fact table (`entity_name`, `entity_identifier`, and their
   instrument/position equivalents once those exist) gains a
-  `chain_group_key` column, populated by a backfill job joining through
-  `ingestion_source_id`, then maintained going forward by a
-  `BEFORE INSERT OR UPDATE OF input_id` trigger.
+  `source_id` column — a real `FOREIGN KEY REFERENCES source_identity
+  (source_id)`, not a bare `UUID` — populated by a backfill job joining
+  through `input.ingestion_id -> ingestion.source_id`, then maintained
+  going forward by a `BEFORE INSERT OR UPDATE OF input_id` trigger
+  (`set_source_id`).
 - A real partial `UNIQUE` index per fact table:
-  `(entity_id, name_type, chain_group_key) WHERE valid_to IS NULL`
+  `(entity_id, name_type, source_id) WHERE valid_to IS NULL`
   (and the equivalent for each other fact table/slot).
+- **No cascade triggers.** The old design needed two `AFTER UPDATE`
+  triggers to retroactively push a corrected `org_id`'s derived values
+  down three hops (`ingestion_source -> input -> fact tables`) whenever
+  someone fixed a wrong `org_id` in place. `source_id` is a stable
+  surrogate, never recomputed from mutable fields, so there is nothing
+  to retroactively push — a wrong writer identity is fixed by
+  superseding the old `input` row through the ordinary
+  correction/resolution mechanism (Phase 3's `input_anchor`/correction
+  path), same as every other wrong fact in this schema. Do not
+  reintroduce an `AFTER UPDATE` cascade here; if a later deep-dive finds
+  a case that seems to need one, that's a divergence-protocol stop, not
+  something to build around this note.
 
-**Backfill sizing:** check real row counts on the replica for every
-affected fact table before deciding inline-`UPDATE`-in-migration vs. the
-full backfill-endpoint pattern — follow `backfill_pattern.md`'s decision
-rule exactly, don't assume scale.
+**Backfill sizing:** two backfills now, not one — (1) populate
+`source_identity` with the distinct `(source_type, owner_id)` pairs
+implied by existing `ingestion_source` rows and backfill
+`ingestion.source_id` to point at them, then (2) backfill each fact
+table's `source_id` by joining through `input`/`ingestion`. Check real
+row counts on the replica for both steps before deciding
+inline-`UPDATE`-in-migration vs. the full backfill-endpoint pattern —
+follow `backfill_pattern.md`'s decision rule exactly, don't assume
+scale.
 
 **Confirmed and applied — already reflected in `target-schema/schema-basic.sql`, see `target-schema/CHANGELOG.md`:**
-- `pipe_run_id`'s rerun-safety uniqueness is `UNIQUE (chain_group_key, pipe_run_id)`, not
-  `UNIQUE (source_type, pipe_run_id)` — the latter was missing `org_id`
+- `pipe_run_id`'s rerun-safety uniqueness is `UNIQUE (source_id, pipe_run_id)` on `ingestion`, not
+  `UNIQUE (source_type, pipe_run_id)` — the latter was missing `owner_id`
   and would have wrongly rejected two different orgs reusing the same
-  deterministic `pipe_run_id` under one `source_type`.
+  deterministic `pipe_run_id` under one `source_type`. (Originally phrased as
+  `UNIQUE (chain_group_key, pipe_run_id)` before the Phase 1 deep-dive — same
+  reasoning, different column.)
 - **Superseded during Phase 0 — `group_key` is not dropped, it's renamed
   and kept, just stripped of any structural role.** Earlier text here said
   `group_key` was "confirmed safe to drop" from `atlas-service`'s API
@@ -199,25 +242,30 @@ rule exactly, don't assume scale.
   missed that the same field is still needed for *review/diff* purposes
   (e.g. Form ADV's daily snapshot vs. monthly detailed filing, or a future
   second system feeding `system_migration` for the same org, both of which
-  should still chain as one writer under `chain_group_key` but need to stay
-  distinguishable for review). Confirmed fix: `ingestion_source` gains
-  `source_subtype` (`TEXT NOT NULL`, free text, one static value per pipe
-  same as `group_key` was) — deliberately excluded from `chain_group_key`'s
-  formula and not duplicated onto any fact table. `chain_group_key` itself
-  needed no change; it was already `source_type` + `org_id` only. See the
-  Phase 0 row in `target-schema/CHANGELOG.md` for the full reasoning.
+  should still chain as one writer but need to stay distinguishable for
+  review). Confirmed fix: what's now `ingestion` gains `ingestion_subtype`
+  (`TEXT NOT NULL`, free text, one static value per pipe, renamed from
+  `source_subtype` which was itself the renamed `group_key`) — deliberately
+  excluded from `source_id`/uniqueness and not duplicated onto any fact
+  table. The writer-grouping itself (`source_type` + `owner_id` only) needed
+  no change from this. See the Phase 0 row in `target-schema/CHANGELOG.md`
+  for the full reasoning.
+- **Resolved during the Phase 1 deep-dive — `source_visibility` is
+  `GENERATED` off `source_type`, settling what was previously an open
+  question.** It now lives on `source_identity`
+  (`source_type_to_source_visibility(source_type)`), not as an
+  independently-settable column — closing exactly the gap the open question
+  below used to flag: a mismatched `source_visibility`/`source_type` pair
+  could otherwise produce a writer slot with no `owner_id` folded in,
+  silently merging every org's private data under one `source_type` into
+  one slot.
 
 **Pending confirmation — raised during review, not yet confirmed either
-way, nothing in `target-schema/` has been changed for these. Run the
-divergence protocol above on each before Phase 1 implementation starts,
-don't assume an answer:**
-- Should `source_visibility` be `GENERATED` from `source_type` instead
-  of the independently-settable column it currently is in
-  `target-schema/schema-basic.sql`? (The concern: a mismatched
-  `source_visibility`/`source_type` pair could produce a
-  `chain_group_key` with no `org_id` folded in, silently merging every
-  org's private data under one source_type into one writer slot.)
-- Should the `source_type → access_group` SQL function have an
+way, nothing in `target-schema/` has been changed for this. Run the
+divergence protocol above before Phase 1 implementation starts, don't
+assume an answer:**
+- Should the `source_type → access_group` SQL function
+  (`source_type_to_access_group`, now on `source_identity`) have an
   `ELSE RAISE EXCEPTION` branch, instead of the bare `CASE` it currently
   has in `target-schema/schema-basic.sql` that can fall through to
   `NULL`? (The concern: a `NULL` `access_group` is invisible to every
@@ -226,7 +274,7 @@ don't assume an answer:**
 **QC check before adding the unique index (run on replica):**
 ```sql
 -- Must return 0 rows for every fact table before the index is added.
-SELECT entity_id, name_type, chain_group_key, count(*)
+SELECT entity_id, name_type, source_id, count(*)
 FROM entity_name
 WHERE valid_to IS NULL
 GROUP BY 1, 2, 3
@@ -236,9 +284,10 @@ HAVING count(*) > 1;
 **QC check after backfill, before shipping (run on replica):**
 ```sql
 -- Must return 0.
-SELECT count(*) FROM ingestion_source WHERE access_group IS NULL;
-SELECT count(*) FROM entity_name WHERE chain_group_key IS NULL;
--- (repeat the second for every fact table that got the column)
+SELECT count(*) FROM source_identity WHERE access_group IS NULL;
+SELECT count(*) FROM ingestion WHERE source_id IS NULL;
+SELECT count(*) FROM entity_name WHERE source_id IS NULL;
+-- (repeat the last for every fact table that got the column)
 ```
 
 **Exit criterion:** both QC checks clean on the full replica, backfill
@@ -268,7 +317,7 @@ finalized. The working hypothesis discussed is:
 ```
 access_group ∈ allowed_groups
 AND (access_group != 'CLIENT'
-     OR requesting_org = owning_org   -- via ingestion_source.org_id
+     OR requesting_org = owning_org   -- via ingestion.source_id -> source_identity.owner_id
      OR requesting_org = ANY(latest input_grant.org_id for this input))
 ```
 **This agent does not get to finalize this recipe on its own.** Confirm
@@ -358,13 +407,16 @@ write to `input_anchor` (not a second ad hoc script bypassing it) before
 calling this sub-phase done.
 
 **Also confirm before dropping legacy tables:** every fact table that
-needs to participate in the `chain_group_key` correction cascade has
-actually been added to the cascade function
-(`cascade_input_chain_group_key`-equivalent) — this function hardcodes
-the fact-table list, nothing enforces it stays complete as tables are
-added. Write the integration test this needs (correct an `org_id`,
-assert every single fact table type reflects the new key) rather than
-trusting a manual review of the function body.
+carries a `source_id` column actually has its `set_source_id` trigger
+wired up (`BEFORE INSERT OR UPDATE OF input_id`), and that every write
+path for that fact table goes through it rather than setting `source_id`
+directly — there's no cascade function here to hardcode a table list in
+(Phase 1 deliberately removed that mechanism, see
+`target-schema/CHANGELOG.md`'s "Phase 1 deep-dive" row), but nothing
+stops a new fact table being added later without the trigger attached
+either. Write the integration test this needs (write a fact row through
+the normal path, assert its `source_id` matches the owning `input`'s)
+rather than trusting a manual review of each `CREATE TRIGGER` statement.
 
 Only after all three anchor types are fully cut over (reads *and*
 corrections) and baked in for a real production window: drop
