@@ -48,12 +48,19 @@ TOKEN=$(aws rds generate-db-auth-token \
   --profile "$AWS_PROFILE")
 
 echo "== Dumping atlas_prod (schema + data, read-only reader role) =="
+EXCLUDED_TABLES=(attachment attachment_grant attachment_version contact contact_fund contact_fund_family rich_data_correction tag_definition)
+EXCLUDE_ARGS=()
+for t in "${EXCLUDED_TABLES[@]}"; do
+  EXCLUDE_ARGS+=(--exclude-table="public.$t")
+done
 PGPASSWORD="$TOKEN" PGSSLMODE=require pg_dump \
   -h "$POSTGRES_HOST" -p "$POSTGRES_PORT" \
   -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
   --no-owner --no-privileges -Fc \
+  "${EXCLUDE_ARGS[@]}" \
   -f "$DUMP_FILE"
 echo "   dump written to $DUMP_FILE ($(du -h "$DUMP_FILE" | cut -f1))"
+echo "   excluded (reader role lacks SELECT, see migration_roadmap.md Phase 0 notes): ${EXCLUDED_TABLES[*]}"
 
 echo "== Resetting local atlas-service Postgres (Docker Compose) =="
 ( cd "$ATLAS_SERVICE_DIR" && docker compose down -v && docker compose up -d db --wait )

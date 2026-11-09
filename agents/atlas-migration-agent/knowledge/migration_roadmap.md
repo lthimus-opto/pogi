@@ -163,10 +163,13 @@ assumed, and a human needs to see that before Phase 1 writes any DDL.
 
 **What changes:**
 - `ingestion_source` gains `source_visibility`, `chain_group_key`,
-  `access_group` as described in `schema-basic.sql` — **except**:
-  `source_visibility` must be `GENERATED ALWAYS AS (...) STORED` off
+  `access_group`, and `source_subtype` as described in `schema-basic.sql`
+  — **except**: `source_visibility` must be `GENERATED ALWAYS AS (...) STORED` off
   `source_type`, **not** a free column. (Open decision, resolved below
-  — do not implement it as a plain column.)
+  — do not implement it as a plain column.) `source_subtype` (`TEXT NOT NULL`,
+  the renamed `group_key`) is a plain column, not generated, and deliberately
+  plays no part in `chain_group_key` or any uniqueness — pure review/diff
+  metadata, confirmed during Phase 0, see `target-schema/CHANGELOG.md`.
 - Each fact table (`entity_name`, `entity_identifier`, and their
   instrument/position equivalents once those exist) gains a
   `chain_group_key` column, populated by a backfill job joining through
@@ -186,16 +189,23 @@ rule exactly, don't assume scale.
   `UNIQUE (source_type, pipe_run_id)` — the latter was missing `org_id`
   and would have wrongly rejected two different orgs reusing the same
   deterministic `pipe_run_id` under one `source_type`.
-- `group_key` (the free-text field on API request schemas) is confirmed
-  safe to drop — verified empirically against every pipe in
-  `data-factory`: each defines exactly one static `group_key` constant
-  per dataset, and `org_id` is what already does real tenant separation.
-  No pipe relies on finer-than-`(source_type, org_id)` granularity. This
-  is about the `atlas-service` API schemas, not `schema-basic.sql`
-  itself (which never had a `group_key` column) — don't re-verify this
-  per migration, it's closed, but if a *new* pipe is added before this
-  phase ships that contradicts it, stop and report per the divergence
-  protocol above.
+- **Superseded during Phase 0 — `group_key` is not dropped, it's renamed
+  and kept, just stripped of any structural role.** Earlier text here said
+  `group_key` was "confirmed safe to drop" from `atlas-service`'s API
+  request schemas, verified against every pipe in `data-factory` each
+  defining exactly one static `group_key` constant per dataset with
+  `org_id` doing the real tenant separation. That verification was correct
+  as far as it went — no pipe needs `group_key` for *chaining* — but it
+  missed that the same field is still needed for *review/diff* purposes
+  (e.g. Form ADV's daily snapshot vs. monthly detailed filing, or a future
+  second system feeding `system_migration` for the same org, both of which
+  should still chain as one writer under `chain_group_key` but need to stay
+  distinguishable for review). Confirmed fix: `ingestion_source` gains
+  `source_subtype` (`TEXT NOT NULL`, free text, one static value per pipe
+  same as `group_key` was) — deliberately excluded from `chain_group_key`'s
+  formula and not duplicated onto any fact table. `chain_group_key` itself
+  needed no change; it was already `source_type` + `org_id` only. See the
+  Phase 0 row in `target-schema/CHANGELOG.md` for the full reasoning.
 
 **Pending confirmation — raised during review, not yet confirmed either
 way, nothing in `target-schema/` has been changed for these. Run the

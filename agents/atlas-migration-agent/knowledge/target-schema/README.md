@@ -26,8 +26,12 @@ ingestion_source  (one write run -- a job, a one-off API hit, a manual upload)
     -> entity_name / entity_identifier / ... (the actual facts)
 ```
 
-- `INGESTION_SOURCE` -- one row per run: `source_type`, `org_id` (private sources only),
-  `pipe_type`, `pipe_run_id` (rerun-safety).
+- `INGESTION_SOURCE` -- one row per run: `source_type`, `source_subtype` (free text, e.g.
+  `"form_adv_monthly"` vs `"form_adv_daily"`, or which legacy system a `system_migration` run
+  came from -- pure review/diff metadata, never structural: it plays no part in
+  `chain_group_key` or any uniqueness, and isn't duplicated onto any fact table, so two runs
+  with different `source_subtype` but the same `source_type`/`org_id` still chain together as
+  one writer), `org_id` (private sources only), `pipe_type`, `pipe_run_id` (rerun-safety).
 - `INPUT` -- one row per *record* within that run, not per run. This is the real point of
   `INPUT`: one `INGESTION_SOURCE` can contain many `INPUT`s, and now that each one is its own
   addressable row, a single record out of a whole batch can be corrected, or shared with

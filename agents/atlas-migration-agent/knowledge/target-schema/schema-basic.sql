@@ -99,6 +99,7 @@ $$ LANGUAGE sql IMMUTABLE;
 CREATE TABLE ingestion_source (
     ingestion_source_id UUID NOT NULL PRIMARY KEY DEFAULT uuidv7(),
     source_type SOURCE_TYPE NOT NULL,
+    source_subtype TEXT NOT NULL,
     source_visibility SOURCE_VISIBILITY NOT NULL,
     org_id UUID,
     pipe_type PIPE_TYPE NOT NULL,

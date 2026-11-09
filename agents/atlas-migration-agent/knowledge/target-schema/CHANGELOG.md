@@ -12,6 +12,7 @@ phase's deep-dive, not a judgment call made unilaterally.
 | 2024 review | `schema-basic.sql` | `ingestion_source.pipe_run_id` rerun-safety constraint changed from `UNIQUE (source_type, pipe_run_id)` to `UNIQUE (chain_group_key, pipe_run_id)` | The original was missing `org_id` — two different orgs reusing the same deterministic `pipe_run_id` under one `source_type` would have been wrongly rejected as a collision | Human, explicit "yeah you're right" |
 | 2024 review | `schema-basic.sql` | `anchor.anchor_id` default changed from `uuidv4()` to `uuidv7()` | Consistency with every other PK in the file, which already uses `uuidv7()` for insert locality; no justification was ever written down for `anchor_id` being the one exception | Human, explicit "yes we should use uuidv7()" |
 | 2024 review | `schema-basic.sql` | Removed `embedding_model`/`embedding` columns and their `CHECK (num_nonnulls(...) IN (0, 2))` constraint from `entity_name` | `entity_name` should only change for the lineage columns (`input_id`, `chain_group_key`, `provenance_id`); embeddings belong exclusively on `entity_embedding`, mirroring how `entity_fuzzy_match` already stays separate and lineage-free. The two-places-for-one-fact duplication this fixes could otherwise let an entity's "live" embedding and its audited embedding history silently drift apart | Human, explicit "this is wrong ... should not change except for the lineage piece" |
+| Phase 0 (this migration) | `schema-basic.sql` + `README.md` | Reversed the "`group_key` confirmed safe to drop" item below: re-added as `ingestion_source.source_subtype` (`TEXT NOT NULL`), free text, deliberately excluded from `chain_group_key` and not duplicated onto any fact table | Raised during Phase 0: `source_type`/`org_id` alone can't distinguish real review-relevant subcategories that should still chain together as one writer — e.g. Form ADV's daily snapshot vs. monthly detailed filing, or a future second legacy system feeding `system_migration` for the same org. `chain_group_key`'s formula (`source_type` + `org_id` only) was already correct and needed no change; only the earlier "drop `group_key` entirely" call was wrong — it should have been "drop it from chaining/uniqueness, keep it renamed as pure metadata." Not nullable: every pipe already sets exactly one static value today, so there's no real case for omitting it | Human, explicit "should not be nullable and free text is fine" |
 
 ## Confirmed, but no `schema-basic.sql` edit needed
 
@@ -20,13 +21,15 @@ the table above — they just don't correspond to a line in this SQL file,
 so there's nothing to change here. Listed separately so they don't get
 mistaken for still-undecided items below.
 
-- `group_key` is confirmed safe to drop from `atlas-service`'s API
-  request schemas — verified empirically against every pipe in
-  `data-factory`: each defines exactly one static `group_key` constant
-  per dataset, and `org_id` is what already does the real tenant
-  separation. `schema-basic.sql` never had a `group_key` column, so
-  there's no SQL to change; the actual work for this one is in
-  `atlas-service`'s Python request schemas, not here.
+- ~~`group_key` is confirmed safe to drop from `atlas-service`'s API
+  request schemas~~ — **superseded, see the Phase 0 row above.** Still true
+  that no pipe needs `group_key`/`source_subtype` for *chaining* purposes
+  (verified empirically against every pipe in `data-factory`, `org_id`
+  already does real tenant separation) — but it turned out to still be
+  needed for *review/diff* purposes, so it comes back as
+  `ingestion_source.source_subtype`, not dropped outright. Do not re-flag
+  this as closed-and-done again without reading the Phase 0 row above
+  first.
 
 ## Still open — raised, not yet confirmed either way
 
