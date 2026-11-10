@@ -212,12 +212,29 @@ assumed, and a human needs to see that before Phase 1 writes any DDL.
   `source_id` column — a real `FOREIGN KEY REFERENCES source_identity
   (source_id)`, not a bare `UUID` — populated by a backfill job joining
   through `input.ingestion_id -> ingestion.source_id`, then maintained
-  going forward by a `BEFORE INSERT OR UPDATE OF input_id` trigger
-  (`set_source_id`).
+  going forward by the application service layer: resolved once per
+  write request in Python (`IngestionSourceService.get_source_id_by_ingestion_source_id`,
+  same convention as `get_source_entitlement_group` in
+  `app/utils/entitlement_utils.py`) and threaded down as a plain
+  parameter into the relevant `*_ingest_service.py`/`*_service.py`
+  write paths — **not** a DB trigger. `target-schema/schema-basic.sql`
+  originally had a `BEFORE INSERT OR UPDATE OF input_id` trigger
+  (`set_source_id`) doing this same one-hop copy at the DB layer; that
+  trigger has been removed from the target schema (confirmed, see
+  `target-schema/CHANGELOG.md`'s "Phase 1 implementation deep-dive"
+  row) — **no DB triggers anywhere in this migration, full stop**, not
+  just no cascade triggers. This also applies to every other trigger
+  `schema-basic.sql` still has for tables that don't exist yet
+  (`input_set_derived_columns`, `check_input_anchor_reason`) — those
+  need the same Python-at-service-layer redesign before Phase 2/3
+  writes any migration for them; they are deliberately left as-is in
+  the SQL file for now since rewriting a table that isn't being built
+  yet isn't this phase's job, but don't copy their trigger-based shape
+  forward when that phase starts.
 - A real partial `UNIQUE` index per fact table:
   `(entity_id, name_type, source_id) WHERE valid_to IS NULL`
   (and the equivalent for each other fact table/slot).
-- **No cascade triggers.** The old design needed two `AFTER UPDATE`
+- **No cascade triggers, no triggers at all.** The old design needed two `AFTER UPDATE`
   triggers to retroactively push a corrected `org_id`'s derived values
   down three hops (`ingestion_source -> input -> fact tables`) whenever
   someone fixed a wrong `org_id` in place. `source_id` is a stable
@@ -226,9 +243,10 @@ assumed, and a human needs to see that before Phase 1 writes any DDL.
   superseding the old `input` row through the ordinary
   correction/resolution mechanism (Phase 3's `input_anchor`/correction
   path), same as every other wrong fact in this schema. Do not
-  reintroduce an `AFTER UPDATE` cascade here; if a later deep-dive finds
-  a case that seems to need one, that's a divergence-protocol stop, not
-  something to build around this note.
+  reintroduce an `AFTER UPDATE` cascade here, and do not reintroduce
+  any other kind of DB trigger either (see above) — if a later
+  deep-dive finds a case that seems to need one, that's a
+  divergence-protocol stop, not something to build around this note.
 
 **Backfill sizing:** two backfills now, not one — (1) populate
 `source_identity` with the distinct `(source_type, owner_id)` pairs
@@ -422,16 +440,19 @@ write to `input_anchor` (not a second ad hoc script bypassing it) before
 calling this sub-phase done.
 
 **Also confirm before dropping legacy tables:** every fact table that
-carries a `source_id` column actually has its `set_source_id` trigger
-wired up (`BEFORE INSERT OR UPDATE OF input_id`), and that every write
-path for that fact table goes through it rather than setting `source_id`
-directly — there's no cascade function here to hardcode a table list in
-(Phase 1 deliberately removed that mechanism, see
-`target-schema/CHANGELOG.md`'s "Phase 1 deep-dive" row), but nothing
-stops a new fact table being added later without the trigger attached
-either. Write the integration test this needs (write a fact row through
-the normal path, assert its `source_id` matches the owning `input`'s)
-rather than trusting a manual review of each `CREATE TRIGGER` statement.
+carries a `source_id` column actually has it populated correctly on
+every write through the application service layer (not a DB trigger —
+see this roadmap's Phase 1 section and `target-schema/CHANGELOG.md`'s
+"Phase 1 implementation deep-dive" row for why), and that every write
+path for that fact table resolves `source_id` the same way
+(`IngestionSourceService.get_source_id_by_ingestion_source_id`,
+threaded down as a plain parameter) rather than setting it some other
+way — there's no cascade function or trigger here to hardcode a table
+list in, but nothing stops a new fact table being added later without
+this wiring either. Write the integration test this needs (write a
+fact row through the normal path, assert its `source_id` matches the
+owning `input`'s) rather than trusting a manual review of each write
+path.
 
 Only after all three anchor types are fully cut over (reads *and*
 corrections) and baked in for a real production window: drop

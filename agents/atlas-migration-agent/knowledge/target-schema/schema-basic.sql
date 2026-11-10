@@ -194,10 +194,11 @@ CREATE TABLE provenance (
 -- means something at the grain of one atomic claim -- that's each fact table below, not INPUT.
 --
 -- SOURCE_ID/ACCESS_GROUP here are a straight, one-hop copy of the owning INGESTION's
--- SOURCE_IDENTITY row -- set once by a trigger at insert time, never recomputed, never
--- settable directly by app code (same reasoning for both: both are derived from SOURCE_TYPE/
--- OWNER_ID, neither is an independent choice). SOURCE_ID gets copied again, one more hop, to
--- every fact table below -- see `set_source_id` further down -- and it's a real FK now, not
+-- SOURCE_IDENTITY row -- set once by the application service layer at insert time, never
+-- recomputed, never settable directly by app code beyond that single lookup (same reasoning
+-- for both: both are derived from SOURCE_TYPE/ OWNER_ID, neither is an independent choice).
+-- SOURCE_ID gets copied again, one more hop, to every fact table below -- see the
+-- Source-id-propagation note further down -- and it's a real FK now, not
 -- an opaque hash, so Postgres itself enforces that it points at a real writer. ACCESS_GROUP
 -- stops here; it's a per-INPUT fact, nothing downstream needs its own copy.
 --
@@ -271,18 +272,14 @@ CREATE TABLE input_grant (
 -- Source-id propagation -- the structural fix for the write-ownership bug
 -- ============================================================================================
 
--- Every fact table below carries `source_id`, always populated by this trigger as a straight
--- one-hop copy from the INPUT behind the row's `input_id` -- never settable directly by app
--- code, and a real FK into SOURCE_IDENTITY, not an opaque hash. The "one open row per slot"
+-- Every fact table below carries `source_id`, always populated by the application service
+-- layer as a straight one-hop copy from the INPUT behind the row's `input_id` -- resolved in
+-- Python once per write request (the same convention as `get_source_entitlement_group` in
+-- `atlas-service`), never by a DB trigger, and never settable independently of that lookup.
+-- It's a real FK into SOURCE_IDENTITY, not an opaque hash. The "one open row per slot"
 -- unique index on each fact table keys on this single column, so two different writers (two
 -- orgs, or an org vs. a licensed source) can never collide, no matter what source_type either
 -- of them shares.
-CREATE OR REPLACE FUNCTION set_source_id() RETURNS TRIGGER AS $$
-BEGIN
-    SELECT source_id INTO NEW.source_id FROM input WHERE input_id = NEW.input_id;
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
 
 -- ============================================================================================
 -- Resolution
@@ -365,9 +362,8 @@ CREATE TABLE input_silver_identifier (
 
     UNIQUE (source_id, silver_id)
 );
-CREATE TRIGGER input_silver_identifier_set_source_id
-    BEFORE INSERT OR UPDATE OF input_id ON input_silver_identifier
-    FOR EACH ROW EXECUTE FUNCTION set_source_id();
+-- SOURCE_ID is set by the application service layer at write time (see the note above
+-- Resolution), not by a trigger.
 
 -- An anchor considered (and scored) as a possible match during an attempt. Column names
 -- drop the redundant CANDIDATE_/CANDIDATE_MATCH_ prefix legacy's RESOLUTION_STAGING used
@@ -562,8 +558,8 @@ CREATE INDEX anchor_status_correction_anchor_idx ON anchor_status_correction (an
 -- gets a real, non-null INPUT_ID of its own -- no special-cased NULL, unlike legacy's
 -- RICH_DATA_CORRECTION, which has to write its corrected ENTITY_ATTRIBUTE row with
 -- input_id=None since it has nothing better to point to. A real INPUT_ID here also means
--- SOURCE_ID propagates to that row through the ordinary `set_source_id` trigger,
--- same path every other fact table's write already goes through -- no bespoke plumbing
+-- SOURCE_ID propagates to that row through the ordinary application-service-layer write
+-- path, same as every other fact table's write already goes through -- no bespoke plumbing
 -- needed just for corrections. INGESTION_ID itself is never stored directly, same as
 -- every other table here once INPUT_ID is present -- it's always one hop away via
 -- INPUT.ingestion_id.
@@ -642,9 +638,8 @@ CREATE TABLE entity_name (
     recorded_at TIMESTAMP NOT NULL DEFAULT (now() AT TIME ZONE 'UTC')
 );
 
-CREATE TRIGGER entity_name_set_source_id
-    BEFORE INSERT OR UPDATE OF input_id ON entity_name
-    FOR EACH ROW EXECUTE FUNCTION set_source_id();
+-- SOURCE_ID is set by the application service layer at write time (see the note above
+-- Resolution), not by a trigger.
 -- One open row per (entity, name_type, writer) -- the actual fix: two different writers (two
 -- orgs, or an org vs. a licensed source) sharing the same source_type still get two
 -- independent slots, because their source_id values differ structurally -- never one.
@@ -668,9 +663,8 @@ CREATE TABLE entity_identifier (
     provenance_id UUID REFERENCES provenance (provenance_id),
     recorded_at TIMESTAMP NOT NULL DEFAULT (now() AT TIME ZONE 'UTC')
 );
-CREATE TRIGGER entity_identifier_set_source_id
-    BEFORE INSERT OR UPDATE OF input_id ON entity_identifier
-    FOR EACH ROW EXECUTE FUNCTION set_source_id();
+-- SOURCE_ID is set by the application service layer at write time (see the note above
+-- Resolution), not by a trigger.
 CREATE UNIQUE INDEX entity_identifier_open_slot_idx
     ON entity_identifier (entity_id, identifier_type, source_id)
     WHERE valid_to IS NULL;
@@ -744,7 +738,7 @@ CREATE INDEX entity_embedding_hnsw_idx ON entity_embedding USING hnsw (embedding
 
 -- Note, for anyone looking for the equivalent of legacy's `cascade_input_chain_group_key`:
 -- there is deliberately no such trigger here. SOURCE_ID is a stable surrogate key, set once
--- at insert time via `set_source_id` above and never recomputed, so there's nothing to
+-- at write time by the application service layer and never recomputed, so there's nothing to
 -- retroactively push down a chain for. Fixing a wrong writer identity goes through the
 -- ordinary correction/resolution mechanism instead (supersede the old row, write a new one) --
 -- not a bespoke UPDATE-driven cascade.
