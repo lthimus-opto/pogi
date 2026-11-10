@@ -1,4 +1,4 @@
-Status: Phase 0
+Status: Phase 1
 
 # Atlas Data Model Migration — Roadmap
 
@@ -165,6 +165,21 @@ collisions. Any mismatch is a stop-and-report, not something to patch
 around — a mismatch here means either the SQL port of the mapping logic
 is wrong, or there's historical data written under different rules than
 assumed, and a human needs to see that before Phase 1 writes any DDL.
+
+**Verified clean against the live `atlas_prod` replica (2026-11-10):**
+- `access_group` ported from `get_source_entitlement_group` vs. live
+  `entitlement_group` on every `ingestion_source` row: 0 mismatches out
+  of 2,331 rows.
+- `source_visibility`/`owner_id` CHECK (`PRIVATE` iff `owner_id IS NOT
+  NULL`), using the corrected mapping from the Phase 0 QC follow-up row
+  in `target-schema/CHANGELOG.md` (ARCH moved to `PRIVATE`): 0
+  violations across all 2,331 rows.
+- Would-be `(entity_id/instrument_id, name_type/identifier_type,
+  source_type, org_id)` open-slot collisions on `entity_name`,
+  `entity_identifier`, `instrument_name`, `instrument_identifier`: 1
+  found initially (a duplicate `Figment Inc.` `BRAND_NAME` row under
+  `ARCH`, two open rows for the same slot), fixed directly in prod,
+  re-verified clean: 0 collisions remaining across all four tables.
 
 **Nothing in this phase touches schema.** It's pure verification.
 

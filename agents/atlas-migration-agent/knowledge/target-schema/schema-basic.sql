@@ -62,9 +62,15 @@ CREATE TYPE record_status AS ENUM ('ACTIVE', 'INACTIVE', 'LOGICALLY_DELETED', 'M
 -- settles what was an open question on the old design: a mismatched SOURCE_VISIBILITY/
 -- SOURCE_TYPE pair could otherwise produce a writer slot with no OWNER_ID folded in, silently
 -- merging every org's private data under one SOURCE_TYPE into one slot.
+-- Confirmed via atlas-service PR #148 ("Flip ARCH source_visibility to PRIVATE, backfill
+-- org_id"): ARCH is PRIVATE, not LICENSED -- every ARCH ingestion_source row carries a real
+-- OWNER_ID (today always OPTO's own org, via the backfill migration that PR shipped), same
+-- as MANUAL/PITCH_DECK/SYSTEM_MIGRATION. The rule is exactly OWNER_ID-shaped: anything that
+-- carries a real OWNER_ID is PRIVATE; only MSCI/SEC_ADV/SEC_EDGAR (no OWNER_ID, ever) are
+-- LICENSED.
 CREATE OR REPLACE FUNCTION source_type_to_source_visibility(value SOURCE_TYPE) RETURNS SOURCE_VISIBILITY AS $$
     SELECT CASE
-        WHEN value IN ('SEC_ADV', 'SEC_EDGAR', 'MSCI', 'ARCH') THEN 'LICENSED'::source_visibility
+        WHEN value IN ('SEC_ADV', 'SEC_EDGAR', 'MSCI') THEN 'LICENSED'::source_visibility
         ELSE 'PRIVATE'::source_visibility
     END;
 $$ LANGUAGE sql IMMUTABLE;
