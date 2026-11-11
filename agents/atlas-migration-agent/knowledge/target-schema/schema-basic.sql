@@ -27,10 +27,16 @@ CREATE TYPE pipe_type AS ENUM ('DAGSTER', 'AIRFLOW', 'AWS_LAMBDA', 'AD_HOC');
 
 -- Determines whether a writer identity (SOURCE_IDENTITY, below) needs OWNER_ID to
 -- disambiguate it. PRIVATE sources (an org's own uploads) can be shared by many different
--- orgs through the same generic pipe, so the owner is required. LICENSED sources (regulatory
--- filings, licensed vendor feeds) are each inherently a single writer already -- there's
--- exactly one SEC, one MSCI -- so no owner is needed or allowed.
-CREATE TYPE source_visibility AS ENUM ('LICENSED', 'PRIVATE');
+-- orgs through the same generic pipe, so the owner is required. LICENSED/PUBLIC sources
+-- (regulatory filings, licensed vendor feeds) are each inherently a single writer already --
+-- there's exactly one SEC, one MSCI -- so no owner is needed or allowed. Three values, not
+-- two, matching `atlas-service`'s real `OwnershipModel` enum
+-- (`app/common_enums/ingestion_source_type.py`) exactly: `PUBLIC` (SEC_ADV/SEC_EDGAR),
+-- `LICENSED` (MSCI only), `PRIVATE` (everything with a real OWNER_ID: ARCH, MANUAL,
+-- PITCH_DECK, SYSTEM_MIGRATION). An earlier draft of this file collapsed PUBLIC/LICENSED into
+-- one two-value SOURCE_VISIBILITY type -- confirmed wrong, see
+-- `target-schema/CHANGELOG.md`'s "source_identity alignment" row.
+CREATE TYPE ownership_model AS ENUM ('PUBLIC', 'PRIVATE', 'LICENSED');
 
 -- Entitlement: who is allowed to *read* a fact/attachment. Orthogonal to SOURCE_ID (the
 -- writer-identity key, see SOURCE_IDENTITY below).
@@ -54,68 +60,50 @@ CREATE TYPE record_status AS ENUM ('ACTIVE', 'INACTIVE', 'LOGICALLY_DELETED', 'M
 -- registry belongs to user_service. It arrives here as a plain, immutable snapshot captured
 -- at write time, same as `source_type` -- never looked up via a local join.
 --
--- SOURCE_VISIBILITY/ACCESS_GROUP both live here, not on INGESTION below: both are derived
+-- OWNERSHIP_MODEL/ACCESS_GROUP both live here, not on INGESTION below: both are derived
 -- purely from SOURCE_TYPE (+ OWNER_ID for ACCESS_GROUP), which makes them properties of the
 -- *writer*, not of any individual ingestion run.
 --
--- SOURCE_VISIBILITY is GENERATED off SOURCE_TYPE, not an independently-settable column --
--- settles what was an open question on the old design: a mismatched SOURCE_VISIBILITY/
--- SOURCE_TYPE pair could otherwise produce a writer slot with no OWNER_ID folded in, silently
--- merging every org's private data under one SOURCE_TYPE into one slot.
--- Confirmed via atlas-service PR #148 ("Flip ARCH source_visibility to PRIVATE, backfill
--- org_id"): ARCH is PRIVATE, not LICENSED -- every ARCH ingestion_source row carries a real
--- OWNER_ID (today always OPTO's own org, via the backfill migration that PR shipped), same
--- as MANUAL/PITCH_DECK/SYSTEM_MIGRATION. The rule is exactly OWNER_ID-shaped: anything that
--- carries a real OWNER_ID is PRIVATE; only MSCI/SEC_ADV/SEC_EDGAR (no OWNER_ID, ever) are
--- LICENSED.
-CREATE OR REPLACE FUNCTION source_type_to_source_visibility(value SOURCE_TYPE) RETURNS SOURCE_VISIBILITY AS $$
-    SELECT CASE
-        WHEN value IN ('SEC_ADV', 'SEC_EDGAR', 'MSCI') THEN 'LICENSED'::source_visibility
-        ELSE 'PRIVATE'::source_visibility
-    END;
-$$ LANGUAGE sql IMMUTABLE;
+-- OWNERSHIP_MODEL and ACCESS_GROUP are plain, NOT NULL columns, set exactly once by the
+-- application service layer at insert time -- not SQL `GENERATED` columns, and not computed
+-- by a SQL function. An earlier draft of this file made both `GENERATED ALWAYS AS (...)
+-- STORED` off two Postgres functions (`source_type_to_source_visibility`,
+-- `source_type_to_access_group`). Confirmed wrong: this project avoids DB triggers *and* SQL
+-- functions for every derived value, full stop -- they're computed in Python instead, at the
+-- application service layer, the same way `atlas-service` already computes `access_group`
+-- via `get_source_entitlement_group` (`app/utils/entitlement_utils.py`) and `ownership_model`
+-- via the `OWNERSHIP_MODEL` dict (`app/common_enums/ingestion_source_type.py`), both called
+-- once when a `source_identity` row is first created and never revisited. See
+-- `target-schema/CHANGELOG.md`'s "source_identity alignment" row.
+--
+-- `get_source_entitlement_group`'s `case _: raise ValueError(...)` also resolves this file's
+-- old "pending confirmation" item on whether the access-group mapping should error instead of
+-- falling through to NULL on an unhandled SOURCE_TYPE: yes -- an unhandled case is a hard
+-- Python exception, not a silently-NULL column.
 
--- ACCESS_GROUP is derived, never independently chosen -- ported directly from legacy's
--- `get_source_entitlement_group`, the "single point of truth" function legacy's own code
--- warns never to edit without sign-off from the entitlements/data-access owners. Same two
--- inputs as SOURCE_VISIBILITY (SOURCE_TYPE + OWNER_ID), same reasoning: if it's derived from
--- the same facts every time, it shouldn't also be a free column the app can set to anything.
--- OPTO_ORG_ID is legacy's actual hardcoded constant (the firm's own org id) -- kept as the
--- same literal, not re-derived or looked up, matching legacy exactly.
-CREATE OR REPLACE FUNCTION source_type_to_access_group(value SOURCE_TYPE, owner UUID) RETURNS ACCESS_GROUP AS $$
-    SELECT CASE
-        WHEN value IN ('SEC_ADV', 'SEC_EDGAR') THEN 'SEC'::access_group
-        WHEN value = 'MSCI' THEN 'MSCI'::access_group
-        WHEN value = 'ARCH' THEN 'ARCH'::access_group
-        WHEN value IN ('MANUAL', 'PITCH_DECK', 'SYSTEM_MIGRATION') THEN
-            CASE WHEN owner = '2346b7f2-b69f-40bb-a53c-d8447008fe42'::uuid
-                THEN 'OPTO'::access_group
-                ELSE 'CLIENT'::access_group
-            END
-    END;
-$$ LANGUAGE sql IMMUTABLE;
-
--- UNIQUE (source_type, owner_id) alone isn't enough to dedupe LICENSED writers: OWNER_ID is
--- NULL for every LICENSED source ("there's exactly one SEC"), and standard SQL treats every
--- NULL as distinct, so two SOURCE_IDENTITY rows could otherwise both be ('SEC_ADV', NULL).
--- The partial index below closes that gap; the plain UNIQUE constraint still covers the
--- PRIVATE/non-null case.
+-- UNIQUE (source_type, owner_id) alone isn't enough to dedupe LICENSED/PUBLIC writers:
+-- OWNER_ID is NULL for every one of them ("there's exactly one SEC"), and standard SQL
+-- treats every NULL as distinct, so two SOURCE_IDENTITY rows could otherwise both be
+-- ('SEC_ADV', NULL). `NULLS NOT DISTINCT` on a single index closes that gap in one index,
+-- instead of a plain `UNIQUE` constraint plus a second partial index for the NULL case (an
+-- earlier draft of this file used that two-index shape; `atlas-service`'s real migration
+-- uses one `NULLS NOT DISTINCT` index, confirmed simpler, no behavior difference).
 CREATE TABLE source_identity (
     source_id UUID NOT NULL PRIMARY KEY DEFAULT uuidv7(),
     source_type SOURCE_TYPE NOT NULL,
     owner_id UUID,
-    source_visibility SOURCE_VISIBILITY GENERATED ALWAYS AS (source_type_to_source_visibility(source_type)) STORED,
-    access_group ACCESS_GROUP GENERATED ALWAYS AS (source_type_to_access_group(source_type, owner_id)) STORED,
+    ownership_model OWNERSHIP_MODEL NOT NULL,
+    access_group ACCESS_GROUP NOT NULL,
     recorded_by TEXT NOT NULL,
     recorded_at TIMESTAMP NOT NULL DEFAULT (now() AT TIME ZONE 'UTC'),
 
-    UNIQUE (source_type, owner_id),
-    CHECK ((source_visibility = 'PRIVATE') = (owner_id IS NOT NULL))
+    CHECK ((ownership_model = 'PRIVATE') = (owner_id IS NOT NULL))
 );
-CREATE UNIQUE INDEX source_identity_licensed_idx ON source_identity (source_type) WHERE owner_id IS NULL;
+CREATE UNIQUE INDEX source_identity_source_type_owner_id_idx
+    ON source_identity (source_type, owner_id) NULLS NOT DISTINCT;
 
 -- One write run (a job, a one-off API hit, a manual upload). What's left here once
--- SOURCE_TYPE/OWNER_ID/SOURCE_VISIBILITY/ACCESS_GROUP move to SOURCE_IDENTITY above: just the
+-- SOURCE_TYPE/OWNER_ID/OWNERSHIP_MODEL/ACCESS_GROUP move to SOURCE_IDENTITY above: just the
 -- per-run facts -- which writer slot this run belongs to (SOURCE_ID, a real FK, never
 -- recomputed), and how/when this particular run happened.
 --

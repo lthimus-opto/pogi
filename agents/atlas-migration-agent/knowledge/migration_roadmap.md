@@ -119,9 +119,9 @@ itself — stop and report it rather than picking one side.
 | Phase | What changes | Risk | Depends on |
 |---|---|---|---|
 | 0 | Reconciliation only — no schema change | None (read-only against replica) | — |
-| 1 | `source_identity` / `ingestion` (renamed from `ingestion_source`) / `source_id` / `access_group` / `source_visibility` on fact tables | Low, self-contained | Phase 0 clean |
+| 1 | `source_identity` / `source_id` / `access_group` / `ownership_model` on fact tables (`ingestion_source` -> `ingestion` rename postponed, see Phase 1 section) | Low, self-contained | Phase 0 clean |
 | 2 | `input_grant` table + read-path wiring | Low (additive), Medium once wired into reads | Phase 1 shipped |
-| 3a | `anchor` / `input` / `input_resolution_attempt` / `input_resolution_candidate` / `input_anchor` — new tables, backfilled, dual-written | High (data reconstruction) | Phase 1 shipped |
+| 3a | `anchor` / `input` / `input_resolution_attempt` / `input_resolution_candidate` / `input_anchor` — new tables, backfilled, dual-written; also where the postponed `ingestion_source` -> `ingestion` rename (table + every fact table's `ingestion_source_id` FK column -> `ingestion_id`) gets bundled in, since this sub-phase already touches every fact table's lineage columns | High (data reconstruction) | Phase 1 shipped |
 | 3b | Cut over **entity** reads to new tables | High | 3a verified clean for a real bake-in window |
 | 3c | Cut over **instrument** reads | High | 3b stable in prod |
 | 3d | Cut over **position** reads | High | 3c stable in prod |
@@ -170,7 +170,7 @@ assumed, and a human needs to see that before Phase 1 writes any DDL.
 - `access_group` ported from `get_source_entitlement_group` vs. live
   `entitlement_group` on every `ingestion_source` row: 0 mismatches out
   of 2,331 rows.
-- `source_visibility`/`owner_id` CHECK (`PRIVATE` iff `owner_id IS NOT
+- `ownership_model`/`owner_id` CHECK (`PRIVATE` iff `owner_id IS NOT
   NULL`), using the corrected mapping from the Phase 0 QC follow-up row
   in `target-schema/CHANGELOG.md` (ARCH moved to `PRIVATE`): 0
   violations across all 2,331 rows.
@@ -185,25 +185,39 @@ assumed, and a human needs to see that before Phase 1 writes any DDL.
 
 ---
 
-## Phase 1 — `source_identity` / `ingestion` / `source_id` / `access_group` / `source_visibility`
+## Phase 1 — `source_identity` / `ingestion` / `source_id` / `access_group` / `ownership_model`
 
 **What changes — superseded design, confirmed during the Phase 1 deep-dive (see
-`target-schema/CHANGELOG.md`, "Phase 1 deep-dive" row, for the full before/after and reasoning):**
+`target-schema/CHANGELOG.md`, "Phase 1 deep-dive" and "source_identity alignment" rows, for
+the full before/after and reasoning):**
 - The old plan computed `chain_group_key` as a `GENERATED` hash
   (`md5(source_type || ':' || org_id)`) directly on `ingestion_source`.
   That's gone. Instead:
   - New table **`source_identity`**: one row per distinct
     `(source_type, owner_id)` writer slot, with a real random
     surrogate `source_id` PK (not derived from `source_type`/`owner_id`
-    by any formula), plus `source_visibility` and `access_group` as
-    `GENERATED` columns off those same two inputs — both moved here
+    by any formula), plus `ownership_model` (three values: `PUBLIC`,
+    `PRIVATE`, `LICENSED`) and `access_group` as plain `NOT NULL`
+    columns — not `GENERATED`, not computed by a SQL function — set
+    once in Python at the application service layer when the row is
+    first created (`atlas-service`'s `OWNERSHIP_MODEL` dict and
+    `get_source_entitlement_group`, respectively), both moved here
     from `ingestion_source` since there's nothing left on the renamed
     `ingestion` table to derive them from.
   - **`ingestion_source` is renamed `ingestion`**, trimmed to per-run
     facts only: `source_id` (FK into `source_identity`),
     `ingestion_subtype` (renamed from `source_subtype`, same free-text
     review/diff-metadata role, still no structural part in uniqueness),
-    `pipe_type`, `pipe_run_id`.
+    `pipe_type`, `pipe_run_id`. **Postponed, not done in Phase 1:** this
+    table rename, and the wider question of whether every fact table's
+    `ingestion_source_id` FK column also gets renamed to `ingestion_id`
+    to match `input.ingestion_id` (40+ model files would be touched by
+    the wide version — every current fact table in the schema, not just
+    `entity_name`/`instrument_name`), is explicitly deferred to be
+    bundled with Phase 3's `ingestion`/`input` split, not done as its
+    own Phase 1 PR. Human, explicit: "actually let's postpone this
+    change. We will bundle it with the logic that split the ingestion
+    table." Don't start this rename on its own before Phase 3 begins.
   - `owner_id` is the renamed `org_id` on this new table only —
     `input_grant.org_id` (a list of *grantee* orgs, unrelated concept)
     is untouched.
@@ -231,9 +245,35 @@ assumed, and a human needs to see that before Phase 1 writes any DDL.
   the SQL file for now since rewriting a table that isn't being built
   yet isn't this phase's job, but don't copy their trigger-based shape
   forward when that phase starts.
-- A real partial `UNIQUE` index per fact table:
-  `(entity_id, name_type, source_id) WHERE valid_to IS NULL`
-  (and the equivalent for each other fact table/slot).
+- `source_identity` is deduped by a single `UNIQUE ... NULLS NOT
+  DISTINCT` index on `(source_type, owner_id)`
+  (`source_identity_source_type_owner_id_idx`) — not a plain `UNIQUE`
+  constraint plus a second partial index for the `owner_id IS NULL`
+  case; the actual shipped migration uses one index, confirmed no
+  behavior difference, see `target-schema/CHANGELOG.md`'s
+  "source_identity alignment" row.
+- **Resolved — yes, each fact table should get a real partial
+  `UNIQUE` index, `(entity_id, name_type, source_id) WHERE valid_to IS
+  NULL` (and the equivalent per other fact table/slot), matching
+  `target-schema/`'s original design. What was actually open wasn't
+  whether to add it, but *when*: human, explicit — "should that not
+  come after all the columns exist and the data migration is
+  completed?" Yes. The index can't meaningfully protect anything while
+  `source_id` is still nullable and not fully backfilled — every
+  unbackfilled historical row has `source_id IS NULL`, and a plain
+  unique index treats `NULL`s as distinct, so the index would only
+  police *new* rows going forward while silently not covering
+  historical data at all. Sequencing, per fact table (or per batch of
+  fact tables sharing one migration):
+  1. Schema-only migration: nullable `source_id` + FK (what's shipped
+     so far for `entity_name`/`entity_identifier`/instrument
+     equivalents).
+  2. Manual or endpoint-driven backfill (per `backfill_pattern.md`'s
+     sizing rule).
+  3. Follow-up migration: `source_id` → `NOT NULL`.
+  4. **Only then**, as part of that same follow-up or a later one: add
+     the partial `UNIQUE` index — by this point every row has a real
+     `source_id` to enforce against.
 - **No cascade triggers, no triggers at all.** The old design needed two `AFTER UPDATE`
   triggers to retroactively push a corrected `org_id`'s derived values
   down three hops (`ingestion_source -> input -> fact tables`) whenever
@@ -283,26 +323,35 @@ scale.
   table. The writer-grouping itself (`source_type` + `owner_id` only) needed
   no change from this. See the Phase 0 row in `target-schema/CHANGELOG.md`
   for the full reasoning.
-- **Resolved during the Phase 1 deep-dive — `source_visibility` is
-  `GENERATED` off `source_type`, settling what was previously an open
-  question.** It now lives on `source_identity`
-  (`source_type_to_source_visibility(source_type)`), not as an
-  independently-settable column — closing exactly the gap the open question
-  below used to flag: a mismatched `source_visibility`/`source_type` pair
-  could otherwise produce a writer slot with no `owner_id` folded in,
-  silently merging every org's private data under one `source_type` into
-  one slot.
+- **Resolved during the Phase 1 deep-dive, then refined by the
+  "source_identity alignment" confirmation — `ownership_model` is a
+  plain, `NOT NULL` three-value column (`PUBLIC`/`PRIVATE`/`LICENSED`),
+  not `GENERATED`.** It lives on `source_identity`, set once in Python
+  at the application service layer when the row is first created
+  (`atlas-service`'s `OWNERSHIP_MODEL` dict,
+  `app/common_enums/ingestion_source_type.py`) — not an independently
+  *re*-settable column after that, and not computed by a SQL function
+  either. This still closes the gap the old open question used to
+  flag: a mismatched `ownership_model`/`source_type` pair could
+  otherwise produce a writer slot with no `owner_id` folded in,
+  silently merging every org's private data under one `source_type`
+  into one slot — enforced here by the `CHECK ((ownership_model =
+  'PRIVATE') = (owner_id IS NOT NULL))` constraint, same as it always
+  was, just off a real column, not a `GENERATED` one. See
+  `target-schema/CHANGELOG.md`'s "source_identity alignment" row for
+  why this is three values (`PUBLIC`/`PRIVATE`/`LICENSED`), not the two
+  (`LICENSED`/`PRIVATE`) an earlier draft of this file had.
 
-**Pending confirmation — raised during review, not yet confirmed either
-way, nothing in `target-schema/` has been changed for this. Run the
-divergence protocol above before Phase 1 implementation starts, don't
-assume an answer:**
-- Should the `source_type → access_group` SQL function
-  (`source_type_to_access_group`, now on `source_identity`) have an
-  `ELSE RAISE EXCEPTION` branch, instead of the bare `CASE` it currently
-  has in `target-schema/schema-basic.sql` that can fall through to
-  `NULL`? (The concern: a `NULL` `access_group` is invisible to every
-  entitlement filter, including internal/admin, with no error anywhere.)
+**Resolved — the `access_group` "pending confirmation" item below is
+settled, not open:**
+- `access_group` is also a plain, `NOT NULL` column on `source_identity`,
+  not `GENERATED`, set once in Python via `get_source_entitlement_group`
+  (`app/utils/entitlement_utils.py`) when the row is first created. That
+  function's `case _: raise ValueError(...)` already answers the
+  question below: an unhandled `source_type` is a hard Python exception
+  at write time, not a silently-`NULL` column — there is no SQL `CASE`
+  to add an `ELSE RAISE EXCEPTION` branch to, because there's no SQL
+  function computing this value at all anymore.
 
 **QC check before adding the unique index (run on replica):**
 ```sql

@@ -28,7 +28,7 @@ source_identity   (one row per distinct (source_type, owner_id) writer slot)
 ```
 
 - `SOURCE_IDENTITY` -- one row per writer slot: `source_type`, `owner_id` (private sources
-  only), and the derived `source_visibility`/`access_group` (both properties of the writer,
+  only), and the derived `ownership_model`/`access_group` (both properties of the writer,
   not of any individual run -- see section 2).
 - `INGESTION` -- one row per run: `source_id` (FK into `SOURCE_IDENTITY`), `ingestion_subtype`
   (free text, e.g. `"form_adv_monthly"` vs `"form_adv_daily"`, or which legacy system a
@@ -47,10 +47,11 @@ source_identity   (one row per distinct (source_type, owner_id) writer slot)
 
 **Worked example** -- one `INGESTION`, three `INPUT`s, each independently correctable:
 ```sql
-INSERT INTO source_identity (source_type, recorded_by)
-VALUES ('SEC_EDGAR', 'pipe-bot');
--- source_visibility ('LICENSED') and access_group ('SEC') are both GENERATED off source_type
--- (see section 3) -- never passed in, never independently settable.
+INSERT INTO source_identity (source_type, owner_id, ownership_model, access_group, recorded_by)
+VALUES ('SEC_EDGAR', NULL, 'PUBLIC', 'SEC', 'pipe-bot');
+-- ownership_model ('PUBLIC') and access_group ('SEC') are computed in Python at the
+-- application service layer before this insert (see section 3) -- never a SQL `GENERATED`
+-- column, never passed in freehand.
 
 INSERT INTO ingestion (source_id, ingestion_subtype, pipe_type, recorded_by)
 VALUES (<source_id>, 'edgar_full_text_search', 'DAGSTER', 'pipe-bot');
@@ -61,8 +62,8 @@ INSERT INTO input (ingestion_id, index, anchor_type, access_group, payload, sche
   (<ingestion_id>, 2, 'ENTITY', 'SEC', '{"name": "Acme Corp", "identifier": "123-CIK"}', 'v1');
 -- all three came from the same run -- correcting or sharing index 2 never touches 0 or 1
 -- access_group is shown here for readability, but it's not an independent choice: it's
--- copied down from source_identity.access_group via ingestion, and the input-insert trigger
--- overwrites whatever value is passed with that derived one.
+-- copied down from source_identity.access_group via ingestion, resolved in Python at the
+-- application service layer, the same way source_id is -- not by a trigger.
 ```
 
 ---
@@ -71,7 +72,8 @@ INSERT INTO input (ingestion_id, index, anchor_type, access_group, payload, sche
 
 **Whoever wrote a row owns it, full stop.** No "shared ownership" case:
 
-- A `LICENSED` source (SEC, MSCI) is owned by **the source itself** -- there's only one.
+- A `LICENSED`/`PUBLIC` source (SEC, MSCI) is owned by **the source itself** -- there's only
+  one.
 - A `PRIVATE` source (a client upload) is owned by **that source's org** -- the same generic
   pipe can be reused by many orgs, so `owner_id` is what disambiguates.
 
@@ -83,12 +85,20 @@ CREATE TABLE source_identity (
     source_id UUID NOT NULL PRIMARY KEY DEFAULT uuidv7(),
     source_type SOURCE_TYPE NOT NULL,
     owner_id UUID,
-    source_visibility SOURCE_VISIBILITY GENERATED ALWAYS AS (source_type_to_source_visibility(source_type)) STORED,
-    access_group ACCESS_GROUP GENERATED ALWAYS AS (source_type_to_access_group(source_type, owner_id)) STORED,
+    ownership_model OWNERSHIP_MODEL NOT NULL,
+    access_group ACCESS_GROUP NOT NULL,
     ...
-    UNIQUE (source_type, owner_id)
 );
+CREATE UNIQUE INDEX source_identity_source_type_owner_id_idx
+    ON source_identity (source_type, owner_id) NULLS NOT DISTINCT;
 ```
+
+`ownership_model`/`access_group` are plain, `NOT NULL` columns -- not SQL `GENERATED` columns.
+Both are computed once in Python, at the application service layer, when a `source_identity`
+row is first created (`atlas-service`'s `OWNERSHIP_MODEL` dict and
+`get_source_entitlement_group`, respectively), the same way `source_id` itself is resolved in
+Python rather than by a DB trigger -- see "No cascade" below. This project avoids DB triggers
+*and* SQL functions for every derived value, full stop.
 
 An earlier draft of this design folded `source_type`/`owner_id` into one opaque, deterministic
 `UUID` (`chain_group_key = md5(source_type || ':' || owner_id)`) computed directly on
@@ -113,14 +123,14 @@ CREATE UNIQUE INDEX entity_name_open_slot_idx ON entity_name (entity_id, name_ty
 
 ### No cascade
 
-Unlike the hash design, there is no cascade here at all. `SOURCE_ID` is set once, by a
-`BEFORE INSERT` trigger, and never revisited. Fixing a wrong writer identity after the fact is
-not an `UPDATE` on existing rows -- it goes through the ordinary correction/resolution
-mechanism instead: the old `INPUT` row is superseded, a new one is written pointing at the
-right `INGESTION`/`SOURCE_IDENTITY`. The old design needed two `AFTER UPDATE` triggers
-(`ingestion_source -> input -> every fact table`) specifically to retroactively push a
-corrected `owner_id`'s derived values down three hops; that entire mechanism is gone, not
-renamed.
+Unlike the hash design, there is no cascade here at all, and no trigger either. `SOURCE_ID`
+is set once, by the application service layer, and never revisited. Fixing a wrong writer
+identity after the fact is not an `UPDATE` on existing rows -- it goes through the ordinary
+correction/resolution mechanism instead: the old `INPUT` row is superseded, a new one is
+written pointing at the right `INGESTION`/`SOURCE_IDENTITY`. The old design needed two
+`AFTER UPDATE` triggers (`ingestion_source -> input -> every fact table`) specifically to
+retroactively push a corrected `owner_id`'s derived values down three hops; that entire
+mechanism is gone, not renamed.
 
 ---
 
