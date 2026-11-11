@@ -378,6 +378,41 @@ for every target table, legacy `ingestion_source_group_key` /
 `entitlement_group` left in place and unused (don't drop them yet —
 that's a later cleanup once Phase 1 has baked in production).
 
+**Progress log (2026-11-11) — not yet exit-criterion-clean, here's exactly what's left:**
+
+- `source_id` backfill: done and `NOT NULL` on every fact table except
+  `entity_attribute`, `entity_identifier`, `entity_name` — those three were nullable
+  but already 0-NULL on `atlas_prod` (verified directly against prod, not assumed).
+  **PR open** (`lucie/input-id-source-id-not-null`) to flip those three plus every
+  still-nullable `input_id` column (21 tables) to `NOT NULL` in one schema-only
+  migration (`a0145b395569`) — not yet merged/deployed, so prod's actual schema state
+  hasn't changed yet as of this log entry.
+- **Real gap found, not previously tracked here: `resolution_correction` has no
+  `source_id` column at all** — not nullable-and-pending, genuinely never added. Every
+  other table in this phase's scope has the column (either `NOT NULL` already or fixed
+  by the open PR above). Whether `resolution_correction` needs one is an open question
+  for this phase, not yet decided — flagging per the divergence protocol rather than
+  silently treating it as done or silently adding it.
+- **Dev (`atlas_dev`) diverged from prod**: real NULL `input_id` data found on 16
+  tables (worst case `entity_strategy` at 50% NULL, `entity_attribute.source_id` was
+  100% NULL until fixed directly), which would have broken the `NOT NULL` migration on
+  deploy to dev. Not a data-quality problem on prod — dev just accumulates
+  test/manual rows prod never sees. Being fixed via a one-off manual backfill
+  (`scripts/backfill_input_id_dev.sql` in the `atlas-service` worktree,
+  lookup-table-first with a `gen_random_uuid()` fallback for anything unresolvable),
+  run by hand against dev, **separate from the migration** — the migration itself
+  stays schema-only and assumes clean data, per `backfill_pattern.md`.
+- **Partial `UNIQUE (id, type, source_id) WHERE valid_to IS NULL` index — step 4 of
+  this phase's own sequencing — has not been started on any table yet.** Checked
+  directly against prod indexes on `entity_name`/`entity_identifier`/
+  `instrument_name`/`instrument_identifier`: all four still only have the old
+  `ingestion_source_group_key`-keyed unique indexes. This is the actual point of
+  this phase and is still fully open, even once the open PR above merges.
+- `source_identity.access_group IS NULL` QC check above has never actually been run
+  against prod — the read-only reader role (`atlas_prod_ro`) has no grant on
+  `source_identity` yet. Still open from the Phase 0 era; needs a grant before this
+  check can run for real instead of being assumed.
+
 ---
 
 ## Phase 2 — `input_grant`
