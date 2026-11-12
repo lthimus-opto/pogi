@@ -378,40 +378,81 @@ for every target table, legacy `ingestion_source_group_key` /
 `entitlement_group` left in place and unused (don't drop them yet —
 that's a later cleanup once Phase 1 has baked in production).
 
-**Progress log (2026-11-11) — not yet exit-criterion-clean, here's exactly what's left:**
+**Progress log (2026-11-11) — superseded by the end-of-session summary immediately below.
+Kept for history; read the summary first.**
 
-- `source_id` backfill: done and `NOT NULL` on every fact table except
-  `entity_attribute`, `entity_identifier`, `entity_name` — those three were nullable
-  but already 0-NULL on `atlas_prod` (verified directly against prod, not assumed).
-  **PR open** (`lucie/input-id-source-id-not-null`) to flip those three plus every
-  still-nullable `input_id` column (21 tables) to `NOT NULL` in one schema-only
-  migration (`a0145b395569`) — not yet merged/deployed, so prod's actual schema state
-  hasn't changed yet as of this log entry.
-- **Real gap found, not previously tracked here: `resolution_correction` has no
-  `source_id` column at all** — not nullable-and-pending, genuinely never added. Every
-  other table in this phase's scope has the column (either `NOT NULL` already or fixed
-  by the open PR above). Whether `resolution_correction` needs one is an open question
-  for this phase, not yet decided — flagging per the divergence protocol rather than
-  silently treating it as done or silently adding it.
-- **Dev (`atlas_dev`) diverged from prod**: real NULL `input_id` data found on 16
-  tables (worst case `entity_strategy` at 50% NULL, `entity_attribute.source_id` was
-  100% NULL until fixed directly), which would have broken the `NOT NULL` migration on
-  deploy to dev. Not a data-quality problem on prod — dev just accumulates
-  test/manual rows prod never sees. Being fixed via a one-off manual backfill
-  (`scripts/backfill_input_id_dev.sql` in the `atlas-service` worktree,
-  lookup-table-first with a `gen_random_uuid()` fallback for anything unresolvable),
-  run by hand against dev, **separate from the migration** — the migration itself
-  stays schema-only and assumes clean data, per `backfill_pattern.md`.
-- **Partial `UNIQUE (id, type, source_id) WHERE valid_to IS NULL` index — step 4 of
-  this phase's own sequencing — has not been started on any table yet.** Checked
-  directly against prod indexes on `entity_name`/`entity_identifier`/
-  `instrument_name`/`instrument_identifier`: all four still only have the old
-  `ingestion_source_group_key`-keyed unique indexes. This is the actual point of
-  this phase and is still fully open, even once the open PR above merges.
-- `source_identity.access_group IS NULL` QC check above has never actually been run
-  against prod — the read-only reader role (`atlas_prod_ro`) has no grant on
-  `source_identity` yet. Still open from the Phase 0 era; needs a grant before this
-  check can run for real instead of being assumed.
+**End-of-session summary (2026-11-11, later same day) — here's where Phase 1 actually
+stands, consolidated:**
+
+**Merged and confirmed live on `atlas_prod`:**
+- **#166** (`a0145b395569`) — `input_id` → `NOT NULL` on 20 fact tables, `source_id` →
+  `NOT NULL` on `entity_attribute`/`entity_identifier`/`entity_name`.
+  `resolution_correction.input_id` deliberately left nullable — documented in the
+  migration itself: a correction with no `input_id` applies to the whole target (see
+  `ingestion_source_service.get_resolutions`), not an oversight.
+- **#168** (`787bd68a9b0d`) — the actual point of Phase 1: `UNIQUE (..., source_id)
+  WHERE valid_to IS NULL` added to 9 tables (`entity_name`, `entity_identifier`,
+  `instrument_name`, `instrument_identifier`, `entity_type`, `entity_strategy`,
+  `entity_operational_phase`, `entity_relationship`, `instrument_type`), plus the
+  write-path changes needed to keep the app consistent with it (supersession-key
+  logic switched from `ingestion_source_group_key` to `source_id`, and a
+  delete-before-update ordering bug fixed on every affected table to avoid a transient
+  window with two open rows).
+- **#170** (`33c5b71d139a`) — **a real production bug #168 introduced, caught and
+  fixed same day.** Once #168 repointed `create_entity_strategies`/
+  `create_entity_types`'s predecessor lookup to `source_id`, the *old*
+  `group_key`-keyed indexes those write paths used to target became actively wrong
+  wherever two different writers share one `group_key` (e.g. every diligence
+  extraction uses the literal string `"diligence_extraction"`): `entity_strategy`
+  threw a raw 500 on the second writer's insert, and `entity_type`'s `ON CONFLICT`
+  arbiter being `group_key`-keyed silently discarded the second writer's claim
+  entirely — no exception, no row, just a lost write. Fixed by dropping both stale
+  `group_key`-keyed indexes (redundant with #168's `source_id` ones anyway) and adding
+  a `source_id`-keyed arbiter index for `entity_type`'s `ON CONFLICT`. **Lesson for any
+  future table doing this same swap: check every index the table's own write path
+  targets, not just the ones this roadmap's audit was checking for collisions** — this
+  bug wasn't a data problem, it was a write-path index that nobody re-pointed.
+
+**Open, not yet merged:**
+- **#171** (`79ff084e109f`) — the same `source_id` open-slot index for
+  `instrument_coupon_attribute` and `instrument_fee_attribute`, held back from #168
+  because both had real duplicate rows on prod. Found, fixed, and **re-verified across
+  all four environments, not just prod**: `instrument_coupon_attribute` was already
+  clean everywhere; `instrument_fee_attribute` had 79 collisions on prod (fixed), 107
+  on dev (106 fixed mechanically + 1 genuine value disagreement — `Invested` vs.
+  `Committed` on the same fee, resolved by hand: most-recent-write wins, confirmed
+  with the user), 21 on demo (fixed, same-day ties handled via a `recorded_at`
+  tiebreak in the ordering), 0 on stage (already clean, no action needed). All fixed
+  via `scripts/fix_instrument_fee_attribute_duplicates.sql`-style chaining
+  (idempotent, skips any group that doesn't unanimously agree on value rather than
+  guessing). **All four environments now clean**; #171 is safe to merge/deploy
+  whenever.
+
+**Resolved, not a lingering risk — `analytics`/`valuation`/`operating_cash_flow`
+dedup keys:** considered and explicitly rejected extending the `source_id`-keyed
+open-slot pattern here. These three use a structurally different mechanism (`INSERT
+... ON CONFLICT (..., group_key) DO UPDATE`, not an open/close temporal chain) where
+`group_key`'s whole job is telling two sub-feeds from the same writer apart (e.g. a
+daily snapshot pipe vs. a monthly detailed-filing pipe); swapping to `source_id` would
+silently collapse those into one row, overwriting one sub-feed's value with another's
+with no error. Confirmed this doesn't collide with `group_key`'s planned retirement
+either: what's actually going away is the FK constraint tying
+`ingestion_source_group_key` to `ingestion_source.group_key`, not the column/value
+itself sitting on fact tables — so dedup keeps working exactly as today indefinitely.
+`operating_cash_flow` has no write path implemented at all yet, so nothing to decide
+there until it does. No action needed, and no follow-up to schedule.
+
+**Still genuinely open, unresolved, needs a human decision:**
+- **`resolution_correction` has no `source_id` column at all.** Raised, then walked
+  back as "probably out of scope" (it's an audit/log table, not a fact table readers
+  see under entitlement rules) — but never got an explicit yes/no. Still sitting
+  open. Low urgency, but shouldn't be silently dropped from tracking either.
+
+**Net: once #171 merges and deploys, Phase 1's actual mechanism (column + backfill +
+NOT NULL + real open-slot uniqueness) is complete and verified on every fact table
+that needed it, across every environment.** The only thing stopping `Status:` at the
+top of this file from advancing is `resolution_correction`'s open question above —
+worth a final human call before marking Phase 1 done, not a blocker on its own merits.
 
 ---
 
