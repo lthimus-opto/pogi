@@ -203,6 +203,9 @@ CREATE TABLE input (
     source_id UUID NOT NULL REFERENCES source_identity (source_id),
     payload JSONB NOT NULL,
     schema_version TEXT NOT NULL,
+    expired_at TIMESTAMP,
+    expiry_reason TEXT,
+    validation_error TEXT,
     recorded_at TIMESTAMP NOT NULL DEFAULT (now() AT TIME ZONE 'UTC'),
 
     UNIQUE (anchor_type, input_id),
@@ -343,12 +346,14 @@ CREATE TABLE input_resolution_attempt (
 -- meaningful for dedup *within* the same SOURCE_ID, never compared across writers.
 CREATE TABLE input_silver_identifier (
     silver_identifier_id UUID NOT NULL PRIMARY KEY DEFAULT uuidv7(),
-    input_id UUID NOT NULL REFERENCES input (input_id),
+    input_id UUID NOT NULL,
+    anchor_type ANCHOR_TYPE NOT NULL,
     silver_id CITEXT NOT NULL,
     source_id UUID NOT NULL REFERENCES source_identity (source_id),
     recorded_at TIMESTAMP NOT NULL DEFAULT (now() AT TIME ZONE 'UTC'),
 
-    UNIQUE (source_id, silver_id)
+    FOREIGN KEY (input_id, anchor_type) REFERENCES input (input_id, anchor_type),
+    UNIQUE (source_id, silver_id, anchor_type)
 );
 -- SOURCE_ID is set by the application service layer at write time (see the note above
 -- Resolution), not by a trigger.
@@ -369,9 +374,16 @@ CREATE TABLE input_silver_identifier (
 -- MATCH_NAME is the candidate's name *as it was at match time* -- kept here even though it's
 -- also visible via ANCHOR_ID -> ENTITY_NAME, since that may have since changed; this is a
 -- permanent record of what was actually compared against, at the time.
+--
+-- CANDIDATE_ID is the key, not (ATTEMPT_ID, ANCHOR_ID), and ANCHOR_ID is nullable, matching
+-- legacy: one row per strategy hit, so the same anchor can appear twice in one attempt, and a
+-- NO_MATCH row ("this strategy found nobody") keeps its strategy and comment. The attempt is
+-- never empty: on no match the resolver creates the anchor and the attempt's
+-- RESOLUTION_TARGET_ID points at it.
 CREATE TABLE input_resolution_candidate (
+    candidate_id UUID NOT NULL PRIMARY KEY DEFAULT uuidv7(),
     attempt_id UUID NOT NULL REFERENCES input_resolution_attempt (attempt_id),
-    anchor_id UUID NOT NULL REFERENCES anchor (anchor_id),
+    anchor_id UUID REFERENCES anchor (anchor_id),
     strategy TEXT NOT NULL,
     match_name CITEXT,
     match_status TEXT,
@@ -381,10 +393,9 @@ CREATE TABLE input_resolution_candidate (
     llm_confidence NUMERIC,
     llm_reasoning TEXT,
     comment TEXT,
-    recorded_at TIMESTAMP NOT NULL DEFAULT (now() AT TIME ZONE 'UTC'),
-
-    PRIMARY KEY (attempt_id, anchor_id)
+    recorded_at TIMESTAMP NOT NULL DEFAULT (now() AT TIME ZONE 'UTC')
 );
+CREATE INDEX input_resolution_candidate_attempt_idx ON input_resolution_candidate (attempt_id);
 
 -- Versioned mapping of an input to the anchor it resolved to -- NOT append-only, matching the
 -- real convention already established elsewhere in this codebase (ATTACHMENT_VERSION):
@@ -403,10 +414,16 @@ CREATE TABLE input_resolution_candidate (
 -- no separate correction table/mechanism needed, and no separate audit table either. Because
 -- VERSION = 0 no longer distinguishes "the first belief" from "the tenth" (unlike the
 -- earlier, append-only design this replaces), that invariant can't be a plain CHECK anymore --
--- it needs a trigger that looks at whether any row already exists for this INPUT_ID (see
--- `check_input_anchor_reason` below): no prior row -> this is the first belief, nothing to
--- explain yet, reason must be NULL; a prior (now-retired) row exists -> this is a correction,
--- reason is required. RECORDED_BY already captures who wrote this row (for a correction,
+-- the application service layer enforces it in the single function that writes this table (no
+-- DB trigger): no prior row -> this is the first belief, nothing to explain yet, operation and
+-- reason must be NULL; a prior (now-retired) row exists -> this is a correction, both are
+-- required.
+--
+-- CORRECTION_ID is generated once per correction request. Every row that request writes
+-- carries it: the corrected input and every position input that moved with it (those use
+-- CORRECTION_OPERATION/REASON = the system value 'cascade'). It has no FK on purpose: VERSION
+-- is renumbered on every retire, so a reference by (INPUT_ID, VERSION) would go stale. NULL on
+-- the first belief. RECORDED_BY already captures who wrote this row (for a correction,
 -- that's the same person who's correcting it), so no separate CORRECTED_BY is needed either.
 --
 -- This does NOT cover every correction legacy logs, though -- MARK_AS_TEST/MANUALLY_DELETE/
@@ -423,6 +440,7 @@ CREATE TABLE input_anchor (
     correction_operation TEXT,
     reason TEXT,
     reason_comment TEXT,
+    correction_id UUID,
     recorded_by TEXT NOT NULL,
     recorded_at TIMESTAMP NOT NULL DEFAULT (now() AT TIME ZONE 'UTC'),
 
@@ -431,33 +449,6 @@ CREATE TABLE input_anchor (
     FOREIGN KEY (anchor_id, anchor_type) REFERENCES anchor (anchor_id, type),
     CHECK (anchor_type = input_anchor_type)
 );
-
--- Enforces the reason rule a plain CHECK can no longer express now that VERSION = 0 doesn't
--- distinguish "first belief" from "tenth" -- this needs to look at other rows for the same
--- INPUT_ID, which a CHECK constraint can't do. Only fires on the VERSION = 0 row being
--- inserted (the retire-UPDATE in step 1 of a correction touches the *other* row, not this
--- one, and isn't a reason-bearing event itself).
-CREATE OR REPLACE FUNCTION check_input_anchor_reason() RETURNS TRIGGER AS $$
-BEGIN
-    IF EXISTS (SELECT 1 FROM input_anchor WHERE input_id = NEW.input_id) THEN
-        -- a prior (now-retired) row already exists -- this is a correction, must explain itself
-        IF NEW.correction_operation IS NULL OR NEW.reason IS NULL THEN
-            RAISE EXCEPTION 'input_anchor: correction_operation and reason are required when correcting an existing belief (input_id=%)', NEW.input_id;
-        END IF;
-    ELSE
-        -- nothing to correct yet -- this is the first belief, nothing to explain
-        IF NEW.correction_operation IS NOT NULL OR NEW.reason IS NOT NULL THEN
-            RAISE EXCEPTION 'input_anchor: correction_operation and reason must be NULL for the first belief (input_id=%)', NEW.input_id;
-        END IF;
-    END IF;
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-
-CREATE TRIGGER input_anchor_check_reason
-    BEFORE INSERT ON input_anchor
-    FOR EACH ROW WHEN (NEW.version = 0)
-    EXECUTE FUNCTION check_input_anchor_reason();
 
 -- Current-row lookup by INPUT_ID needs no index at all -- (0, input_id) is a direct PK hit.
 -- The other direction ("which inputs currently point at anchor Y" -- ANCHOR_STATUS_

@@ -195,8 +195,9 @@ Lives on `INPUT_ANCHOR` itself. `VERSION = 0` is always the current belief -- sa
 already used elsewhere in the codebase (`ATTACHMENT_VERSION`). Correcting it retires the old
 current row to a permanent historical slot (`UPDATE ... SET version = COALESCE(MAX(version),
 0) + 1`), then inserts the new belief at `version = 0` with `correction_operation`/`reason`
-attached -- enforced by a trigger: the very first belief must have no reason, every correction
-always must.
+attached -- enforced by the application service layer, not a trigger: the very first belief must have no reason, every correction
+always must. Every row written by one correction request, including position inputs that move
+as a cascade (system reason `cascade`), carries the same `correction_id`.
 
 **The fact rows underneath it get hard-deleted, never closed with `valid_to`.** `valid_to` means
 "this was true, until it wasn't." A remapping correction means something else: this row was

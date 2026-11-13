@@ -1,4 +1,4 @@
-Status: Phase 1
+Status: Phase 3a — PR 176 (`input` table + backfill) merged and the backfill has finished in prod; the backfill code has been deleted (PR 184) and the write-path wiring PRs (180, 183, 185) are merged; **next up: build the rest of 3a (`anchor`, `input_resolution_attempt`, `input_resolution_candidate`, `input_anchor`, plus the `ingestion_source` -> `ingestion` rename); the design is locked and the design questions are closed (see the 3a "Locked design"); `ON DELETE` actions and the backfill are deferred; the `input_id` FK is deliberately last (see the 3a status block)**; Phase 1 functionally complete (see Phase 1 section's "Net" line) but the one lingering `resolution_correction` sign-off below is still genuinely open, not resolved by lapse of time
 
 # Atlas Data Model Migration — Roadmap
 
@@ -442,6 +442,30 @@ itself sitting on fact tables — so dedup keeps working exactly as today indefi
 `operating_cash_flow` has no write path implemented at all yet, so nothing to decide
 there until it does. No action needed, and no follow-up to schedule.
 
+**Side fix, unrelated to `source_id` — PR #173, "Time Series table need a boost" (not yet
+merged):** a schema/read-path review of `valuation`/`analytics`/`operating_cash_flow`
+(prompted by a human asking about these tables generally, not a Phase 1 task) turned up
+and fixed three independent issues, none of which touch the `source_id`/dedup mechanism
+above:
+- `operating_cash_flow` was missing `input_id` (every other fact table has it per the
+  Atlas column rules in `app/db_schema/README.md`) — added as `NOT NULL` directly, safe
+  because the table has zero rows (confirmed on replica, consistent with "no write path
+  yet" above).
+- Added a `CHECK` on all three tables tying `scoped_to` to the one anchor column that must
+  be populated (`CASE scoped_to WHEN 'ENTITY' THEN entity_id ... END IS NOT NULL`) — closes
+  a real gap where nothing previously enforced that `scoped_to` agrees with which of
+  `entity_id`/`instrument_id`/`position_id` is set, which the four partial dedup unique
+  indexes rely on to pick the right row set.
+- Dropped `valuation`/`analytics`' generic `(entity_id, scoped_to, as_of)` index after
+  fixing `_entity_ids_filter`/`_instrument_ids_filter` in both stores to state
+  `scoped_to = ...` explicitly per `OR` branch (previously implied, never written in the
+  query) — confirmed via `EXPLAIN` on 20k seeded rows that this was necessary and
+  sufficient: without the explicit predicate, Postgres silently falls back to a sequential
+  scan instead of the partial dedup index, CHECK constraint notwithstanding (Postgres does
+  not use table `CHECK` constraints to prove a partial index's `WHERE` clause is satisfied).
+  This also means `instrument_id`/`position_id` never needed their own generic index either
+  — the query fix covers all three anchor types, not just `entity_id`.
+
 **Still genuinely open, unresolved, needs a human decision:**
 - **`resolution_correction` has no `source_id` column at all.** Raised, then walked
   back as "probably out of scope" (it's an audit/log table, not a fact table readers
@@ -526,18 +550,97 @@ conflicting timestamps, a correction with no traceable prior staging
 row), **stop and report the specific `input_id`s** rather than guessing
 which belief should end up at `version = 0`.
 
+**Locked design (confirmed with the human) — resolution, correction, replay.** Do not re-derive. Anything not listed here is not decided: stop and ask.
+
+*Flow.*
+1. A pipeline hits Atlas. Atlas creates one `ingestion`. It creates one `input` per submitted item.
+2. If the input needs resolution, the resolver writes one `input_resolution_attempt`, its `input_resolution_candidate` rows, and an `input_silver_identifier` row when the input has a `silver_id`.
+3. The outcome gives an anchor: ATTACH uses an existing one, INSERT creates an `ACTIVE` one, AMBIGUOUS creates a `TEMPORARY` one. `input_anchor` gets its first row at `version = 0`, with `attempt_id` set and no reason.
+4. The entity (or instrument) and its rich data are written, as today.
+
+*Write order changes.* Today the attempt log and `resolution_input_target` are written last. In the new flow: attempt, then anchor and entity, then `input_anchor`, then rich data. The anchor must exist before `input_anchor` points at it.
+
+*One `input_id` for life.* A correction or replay never creates a new `input` or a new `ingestion`. The current `replay` creates a new ingestion source and new inputs by calling `create_entities`. That breaks the one-input-per-item granularity. It goes away.
+
+*One operation, `apply(input_id, target_anchor_id)`.* Replay and the ATTACH correction are the same operation. The caller always supplies the anchor. The target must differ from the current anchor (`reattach` already fails with 400 when they match). Steps:
+1. Lock the `input` row (`SELECT ... FOR UPDATE`).
+2. Unwind: delete the rich data of this `input_id` (`delete_<anchor>_rich_data_for_input`).
+3. Re-ingest the stored `input.payload` into the target anchor.
+4. Retire the current `input_anchor` row to `MAX(version) + 1`. Insert the new row at `version = 0` with `correction_operation` and `reason`.
+INSERT is the same call, with a newly created anchor as the target. The resolver is not involved: no attempt, no candidates, `attempt_id` is NULL. The resolver runs only on first ingest.
+
+*Single writer.* Exactly one function writes `input_anchor`: `apply`, plus the first-ingest write. No other code path inserts, updates, or deletes in that table.
+
+*No DB trigger for the reason rule.* The first belief has no `correction_operation` and no `reason`. Every later version has both. `apply` enforces this in Python. `check_input_anchor_reason` in `schema-basic.sql` is removed. This follows the project rule already recorded in `target-schema/CHANGELOG.md`: no DB triggers, no SQL functions for derived values.
+
+*Status flips.* MARK_AS_TEST, MANUALLY_DELETE and MARK_AS_ACTIVE do not touch `input_anchor`. They go to `anchor_status_correction`.
+
+*Position cascade.* A position has no resolution step. It moves only as a cascade of an entity or instrument correction. Outcomes are REPOINT, CREATE_NEW, MERGE (`docs/correction_use_cases.md`).
+- Today the cascade writes no `resolution_correction` row and records no reason. It only moves the `position_ingestion_source` links.
+- REPOINT keeps the same `position_id`. The position input's `input_anchor` row does not change.
+- CREATE_NEW and MERGE change the position anchor of the position's inputs. Each such input gets a new `input_anchor` version with `correction_operation` and `reason` set to the system value `cascade`.
+
+*`correction_id`.* `input_anchor` gets a `correction_id UUID` column. `apply` generates one value per correction request. Every `input_anchor` row written by that request carries it: the corrected input and every cascaded position input. With `batch_by_source`, all inputs of the request share one value. To find everything that moved together, query `WHERE correction_id = ...`. The column has no foreign key, on purpose: version numbers are renumbered on every retire, so a reference by `(input_id, version)` would go stale. The first-ingest row has `correction_id` NULL.
+
+*Candidates.* `input_resolution_candidate` has its own `candidate_id` primary key (not `(attempt_id, anchor_id)`). `anchor_id` is nullable. This keeps legacy behavior: one row per strategy hit, so the same anchor can appear twice in one attempt, and a `NO_MATCH` row ("this strategy found nobody") is kept with its strategy and comment. The attempt itself is never empty. On no match the resolver creates the anchor (INSERT) and the attempt's `resolution_target_id` points at it.
+
+*Silver identifier.* `input_silver_identifier` supports legacy scoping. It has an `anchor_type` column, a composite foreign key `(input_id, anchor_type)` to `input`, and `UNIQUE (source_id, silver_id, anchor_type)`. `source_id` takes the place of legacy `group_key`. The row is keyed by input and has no anchor pointer, so a remap does not touch it and re-ingesting the same input does not collide. The lookup is: silver row, then `input_anchor` at `version = 0`, then the anchor.
+
+*Payload expiry.* `input` carries nullable `expired_at`, `expiry_reason` and `validation_error`. When a create schema changes, an Alembic-style step marks the inputs whose payload no longer validates. Replay and `apply` refuse an expired input. Legacy `resolution_input_snapshot` expiry fields were never set by any code.
+
+*Reason vocabulary.* `cascade` is added as an allowed correction reason.
+
+*Deferred.*
+- `ON DELETE` actions for the new foreign keys to `input` and `anchor`: decided after everything is migrated. The `input_id` FK step below stays last.
+- Backfill of `anchor`, attempts, candidates and `input_anchor` (including how attempts are grouped and how `resolution_correction` rows rebuild the version history): discussed when the data moves, not before.
+
+**Status update (after PR 176 merged) — what shipped, what the prod backfill found, and what is still open.**
+
+- **PR 176 is merged.** Three things changed in review. (1) `item_index` is no longer supplied by the caller: `InputItem` has no such field, `InputService` numbers items by position in the batch, and `InputStore.create_inputs` adds `max(item_index) + 1` for that `ingestion_source_id` under a row lock on `ingestion_source`. The offset exists because an `ingestion_source_id` can be reused: the old two-call flow (resolve, then ingest) shared one `ingestion_source_id` per Dagster run. As long as the V2 flow still resolves separately, this reuse stays. Rethinking it is a separate PR. (2) `WritePath` has a docstring that defines each value by the endpoint that produces it. (3) The migration (`1ca2b7e56a61`) was re-parented onto `b7d3e91a4c20` after `main` gained a second head.
+- **The backfill ran in prod and finished.** Dry run against prod first (read-only role, same SQL as the backfill): 278,078 distinct `input_id` across 1,889 ingestion sources. 26,647 had a `resolution_input_snapshot` (written as `CREATE` with the real payload). 251,431 had none (written as `BACKFILL` with payload `{}`). 238 `input_id` had more than one snapshot row, with identical payloads in every case. No `source_id` was missing from `source_identity`. No vote ties.
+- **Two pre-existing ambiguities, both resolved by rule.** (a) 150 `input_id` appeared under more than one `anchor_type` across tables; the resolution tables' `target_type` decides, and all 150 had one. (b) 5 `input_id` appeared under more than one `ingestion_source_id`; the backfill takes a majority vote. In all 5 the minority was `instrument_fee` (4 cases, 2 rows each) or `instrument_coupon` (1 case, 1 row) written against a different ingestion source of the same `source_id` and `group_key`. **These 9 rows were fixed by hand in prod** (direct `UPDATE` of `ingestion_source_id` to the ingestion source the rest of the input points to, in a transaction). Re-running the dry run afterwards showed 0 inputs with more than one ingestion source. The writer that produced the mismatch was not investigated.
+- **Final prod state:** 0 rows missing from `input` across all 27 driving tables. `input` held 278,187 rows at the last check (109 more than the dry-run count, from rows written while the backfill was still running).
+- **Why this matters for the Tier-3 FK below:** if the FK is ever made composite (`input_id` plus `ingestion_source_id`), the 9 hand-fixed rows would have violated it. They are fixed now. A plain `FOREIGN KEY (input_id)` is not affected.
+- **PR 184 deleted the backfill code** (merged). The backfill module, its endpoints, and the startup task are gone.
+- **Write-path wiring is merged.** PR 180 (entity tag), PR 183 (create entity, instrument, position) and PR 185 (seed + analytics) are on `main`. Every former `uuid4()` `input_id` call site goes through `InputService`.
+- **Next, in this order (decided with the human):**
+  1. **Build the rest of 3a:** `anchor`, `input_resolution_attempt`, `input_resolution_candidate`, `input_anchor`, and the bundled `ingestion_source` -> `ingestion` rename, following the "Locked design" above. Read `target-schema/README.md` and `target-schema/schema-basic.sql` first. 
+  2. **Phase 2, `input_grant`.** It does not depend on the FK.
+  3. **Last: the `input_id` FK on the fact tables, plus `delete_input`.** Do it last on purpose. A FK forces every writer and every test to have a real `input` row, so it is costly to redo if `input` or the new tables still change. Its cascade rules also depend on how `input_anchor` and corrections end up. The human must decide whether deleting an `input` cascades into `resolution_staging`, `resolution_correction`, `resolution_input_snapshot` and `resolution_input_target`. Today those four are `RESTRICT` from `ingestion_source`, and `IngestionSourceStore.delete_ingestion_source` clears them by hand. Also decide plain `FOREIGN KEY (input_id)` versus composite `(input_id, ingestion_source_id)`.
+- **Facts for the FK step, checked in code, not yet acted on:** 29 tables carry `input_id`, not about 20. `operating_cash_flow` and `resolution_correction` were never backfilled (`resolution_correction.input_id` is probably optional). `resolution_correction` appeared to have no index on `input_id`. A cascade delete needs one on every child table. Many test helpers insert facts with a random `uuid4()` `input_id`; they all need a real `input` row once the FK exists.
+- **Rollout for the FK, when its turn comes:** (1) read-only gap check on prod, with the same `NOT EXISTS` query per table; close any gap with a one-off fill (the deleted backfill is in git history, `47c8902`); (2) add any missing `input_id` indexes with `CREATE INDEX CONCURRENTLY`; (3) per table, `ADD CONSTRAINT ... NOT VALID` then `VALIDATE CONSTRAINT`, with `lock_timeout` set, and time `entity_attribute` (5.5M rows) on the replica first, because migrations run in the Helm init container and the halfvec migration already timed out there.
+
 **QC check — dual-write agreement (run continuously against replica
 during this sub-phase, or against a copy with replayed traffic):**
 ```sql
--- For every input_id, input_anchor version=0 must agree with whatever
--- resolution_input_target + the live entity_ingestion_source state
--- currently says is the resolved target. Build this as an actual
+-- For every input_id, input_anchor version=0 must agree with the live
+-- entity_ingestion_source state (and its instrument/position equivalents).
+-- Do not use resolution_input_target as the comparison side: it is not
+-- kept in sync by the legacy correction code. Build this as an actual
 -- comparison job, not a one-time check — it needs to hold up over a
 -- real window of live corrections happening during the bake-in period.
 ```
 
 **Exit criterion:** comparison job clean over a real bake-in window
 (not a single point-in-time check) before 3b starts.
+
+**Confirmed design direction (2026-11-13), the actual point of minting `input` as a real table — not just a PR 176 implementation detail, write it down here so it isn't re-derived or second-guessed later:** deletion is meant to cascade at every granularity of this lineage chain, all the way down, by construction:
+
+- Delete a `source_identity.source_id` → every `ingestion_source` row under that writer slot goes, and everything downstream of each of those.
+- Delete an `ingestion_source.ingestion_source_id` → every fact row and every `input` row tied to that one batch goes.
+- Delete an `input.input_id` → everything tied to that one submitted item goes.
+
+Human, explicit, re: why `input` exists at all: "that's exactly why we are creating the input_id as a stable id! and yes it will become a FK to all the tables (which already have the input_id)."
+
+**Verified against the real `atlas-service` code (PR 176, `cde3b2a`) — where this actually stands right now:**
+
+- **Tier 1 (`source_identity` → `ingestion_source`) — already true.** `ingestion_source.source_id` is a plain `foreign_key(SourceIdentityRecord.source_id)` with no override, so it inherits `opto_python_helpers`' default `ON DELETE CASCADE`.
+- **Tier 2 (`ingestion_source` → fact tables, including `input`) — already true, by two different mechanisms that both land in the same place.** Most fact tables (`entity_name`, `entity_attribute`, ..., and now `input` per PR 176's `input_ingestion_source_id_source_id_fkey`) cascade by the same helper default. Four tables — `resolution_staging`, `resolution_correction`, `resolution_input_snapshot`, `resolution_input_target` — are deliberately `RESTRICT` instead, and `IngestionSourceStore.delete_ingestion_source` explicitly clears each of them by hand before deleting the parent row. Either way, deleting an `ingestion_source` row today already takes everything under it with it.
+- **Tier 3 (`input` → every fact table that carries `input_id`) — not true yet, and structurally can't be.** Checked `entity_name_db_schema.py`/`entity_attribute_db_schema.py` directly: `input_id: Mapped[UUID] = mapped_column()` — a bare column, no `FOREIGN KEY` at all, on every one of the ~20 fact tables that have carried `input_id` since Phase 1 (the same table list `input_backfill_internal_api.py`'s `KEYSET_DRIVING_TABLES` already walks). That's expected, not a bug in PR 176 — `input_id` was minted ad hoc in Python in five different places before this PR, so there was never a real row to point an FK at. PR 176 itself also adds no `delete_input` operation at all (`InputService`/`InputStore` only have `create_inputs`).
+
+**Explicit next step this unblocks — not in scope for PR 176 itself, flagged here so it isn't lost:** once `input` has real write-path adoption (the "wiring real write paths to use InputService" step this roadmap already calls out as deferred), add `FOREIGN KEY (input_id) REFERENCES input (input_id) ON DELETE CASCADE ON UPDATE CASCADE` to every fact table in that same ~20-table list, replacing today's bare `input_id` column, plus a real `delete_input` service/store method (and internal API route) to actually exercise it. Until that migration ships, `input_id` on fact tables remains referential-integrity-free, same as it's always been — PR 176 only stood up `input` as a real row to eventually point at, it didn't yet wire the pointing.
+
+Also applies to `target-schema/schema-basic.sql`: every `... REFERENCES input (input_id)` line there (`input_resolution_attempt`, `input_resolution_candidate`, `input_silver_identifier`, `input_anchor`, etc.) currently has no explicit `ON DELETE` action, which defaults to `RESTRICT` in plain SQL — that default disagrees with the cascade-all-the-way-down direction confirmed above and needs the same explicit `ON DELETE CASCADE` added once this is actually implemented, not left to the SQL default. Flagging here rather than editing `schema-basic.sql` now, since no table in that file is implemented yet for this agent to attach the change to.
 
 ### 3b / 3c / 3d — Cut over reads, entity → instrument → position
 
